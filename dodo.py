@@ -12,7 +12,7 @@ import shlex
 from os import environ, getcwd, path
 from pathlib import Path
 
-import settings
+from settings import config
 from colorama import Fore, Style, init
 
 # ====================================================================================
@@ -67,11 +67,15 @@ init(autoreset=True)
 # Configuration and Helpers for PyDoit
 # ====================================================================================
 
-BASE_DIR = Path(settings.BASE_DIR)
-DATA_DIR = Path(settings.DATA_DIR)
-MANUAL_DATA_DIR = Path(settings.MANUAL_DATA_DIR)
-OUTPUT_DIR = Path(settings.OUTPUT_DIR)
-USER = settings.USER
+
+BASE_DIR = Path(config("BASE_DIR"))
+DATA_DIR = Path(config("DATA_DIR"))
+RAW_DATA_DIR = Path(config("RAW_DATA_DIR"))
+MANUAL_DATA_DIR = Path(config("MANUAL_DATA_DIR"))
+OUTPUT_DIR = Path(config("OUTPUT_DIR"))
+PUBLISH_DIR = Path(config("PUBLISH_DIR"))
+USER = config("USER") 
+OS_TYPE = config("OS_TYPE")
 
 ## Helpers for handling Jupyter Notebook tasks
 # fmt: off
@@ -113,7 +117,7 @@ def task_config():
     """Create empty directories for data and output if they don't exist"""
     return {
         "actions": ["ipython ./src/settings.py"],
-        "targets": [DATA_DIR, OUTPUT_DIR],
+        "targets": [RAW_DATA_DIR, OUTPUT_DIR],
         "file_dep": ["./src/settings.py"],
         "clean": [],
     }
@@ -136,7 +140,7 @@ def task_config():
 #         "CRSP_stock.parquet",
 #         "fed_yield_curve.parquet",
 #         ]
-#     targets = [DATA_DIR / file for file in file_output]
+#     targets = [RAW_DATA_DIR / file for file in file_output]
 
 #     return {
 #         "actions": [
