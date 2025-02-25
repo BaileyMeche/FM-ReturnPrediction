@@ -8,3 +8,24 @@ The project aims to replicate **Table 1, Table 2, and Figure 1** from the origin
 ## Data Sources
 - **CRSP** (Center for Research in Security Prices)
 - **Compustat** (Standard & Poor’s financial database)
+
+
+## Quick Start
+
+To quickest way to run code in this repo is to use the following steps. First, you must have the `conda` package manager installed (e.g., via Anaconda).
+
+Thenm open a terminal and navigate to the root directory of the project and create a 
+conda environment using the following command:
+```
+conda create -n env_name_here python=3.12
+conda activate env_name_here
+```
+and then install the dependencies with pip
+```
+pip install -r requirements.txt
+```
+Finally, you can then run 
+```
+doit
+```
+And that's it!
