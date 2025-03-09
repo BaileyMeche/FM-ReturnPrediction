@@ -200,23 +200,7 @@ def pull_Compustat(
         df_cached = _read_cached_data(cached_fp)
         return df_cached
 
-    if gvkey is None:
-        sql_query = f"""
-            SELECT 
-                {vars_str}
-            FROM 
-                comp.funda
-            WHERE 
-                indfmt='INDL' AND -- industrial reporting format (not financial services format)
-                datafmt='STD' AND -- only standardized records
-                popsrc='D' AND -- only from domestic sources
-                consol='C' AND -- consolidated financial statements
-                datadate >= '{start_date}'AND 
-                datadate <= '{end_date}'
-            """
-    else:
-        gvkey_filter = _format_tuple_for_sql_list(gvkey_tuple)
-        sql_query = f"""
+    sql_query = f"""
         SELECT 
             {vars_str}
         FROM 
@@ -227,9 +211,12 @@ def pull_Compustat(
             popsrc='D' AND -- only from domestic sources
             consol='C' AND -- consolidated financial statements
             datadate >= '{start_date}'AND 
-            datadate <= '{end_date}' AND
-            gvkey IN {gvkey_filter}
+            datadate <= '{end_date}'
         """
+    # If filtering on gvkey, add to the SQL query
+    if gvkey is not None:
+        gvkey_filter = _format_tuple_for_sql_list(gvkey_tuple)
+        sql_query += f" AND {gvkey} IN {gvkey_filter}"
 
     # with wrds.Connection(wrds_username=wrds_username) as db:
     #     comp = db.raw_sql(sql_query, date_cols=["datadate"])
