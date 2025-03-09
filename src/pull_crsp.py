@@ -1,7 +1,6 @@
 """
 This module pulls and saves data on fundamentals from CRSP and Compustat.
-It pulls fundamentals data from Compustat needed to calculate
-book equity, and the data needed from CRSP to calculate market equity.
+It pulls fundamentals data from Compustat needed to calculate book equity, and the data needed from CRSP to calculate market equity.
 
 Note: This code uses the new CRSP CIZ format. Information
 about the differences between the SIZ and CIZ format can be found here:
@@ -33,6 +32,18 @@ import wrds
 from pandas.tseries.offsets import MonthEnd
 
 from settings import config
+from utils import (
+    _cache_filename,
+    _hash_cache_filename,
+    _file_cached,
+    _read_cached_data,
+    _write_cache_data,
+    _flatten_dict_to_str,
+    _tickers_to_tuple,
+    _format_tuple_for_sql_list,
+    load_cache_data,
+    _save_cache_data
+)
 
 # ==============================================================================================
 # GLOBAL CONFIGURATION
@@ -43,37 +54,55 @@ WRDS_USERNAME = config("WRDS_USERNAME")
 START_DATE = config("START_DATE")
 END_DATE = config("END_DATE")
 
-
-def get_CRSP_columns(wrds_username=WRDS_USERNAME, table_schema="crsp", table_name="msf_v2"):
-    """Get all column names from CRSP monthly stock file (CIZ format)."""
-
-    sql_query = """
-        SELECT column_name, data_type
-        FROM information_schema.columns
-        WHERE table_schema = {table_schema}
-        AND table_name = {table_name}
-        ORDER BY ordinal_position;
-    """
-    
-    db = wrds.Connection(wrds_username=wrds_username)
-    columns = db.raw_sql(sql_query)
-    db.close()
-    
-    return columns
  
 # ==============================================================================================
-# STOCK DATA
+# CRSP Data
 # ==============================================================================================
 """
 More information about the CRSP US Stock & Indexes Database can be found here:
 https://www.crsp.org/wp-content/uploads/guides/CRSP_US_Stock_&_Indexes_Database_Data_Descriptions_Guide.pdf
 """
 
+description_crsp = {
+    "permno": "Permanent Number - A unique identifier assigned by CRSP to each security.",
+    "permco": "Permanent Company - A unique company identifier assigned by CRSP that remains constant over time for a given company.",
+    "ticker": "Ticker - The stock ticker symbol for the security.",
+    "mthcaldt": "Calendar Date - The date for the monthly data observation.",
+    "dlycaldt": "Calendar Date - The date for the daily data observation.",
+    "issuertype": "Issuer Type - Classification of the issuer, such as corporate or government.",
+    "securitytype": "Security Type - General classification of the security, e.g., stock or bond.",
+    "securitysubtype": "Security Subtype - More specific classification of the security within its type.",
+    "sharetype": "Share Type - Classification of the equity share type, e.g., common stock, preferred stock.",
+    "usincflg": "U.S. Incorporation Flag - Indicator of whether the company is incorporated in the U.S.",
+    "primaryexch": "Primary Exchange - The primary stock exchange where the security is listed.",
+    "conditionaltype": "Conditional Type - Indicator of any conditional issues related to the security.",
+    "tradingstatusflg": "Trading Status Flag - Indicator of the trading status of the security, e.g., active, suspended.",
+    "mthret": "Monthly Return - The total return of the security for the month, including dividends.",
+    "mthretx": "Monthly Return Excluding Dividends - The return of the security for the month, excluding dividends.",
+    "mthprc": "Monthly Price - The price of the security at the end of the month.",
+    "dlyret": "Daily Return - The total return of the security for the day, including dividends.",
+    "dlyretx": "Daily Return Excluding Dividends - The return of the security for the day, excluding dividends.",
+    "dlyprc": "Daily Price - The price of the security at the end of the day.",
+    "shrout": "Shares Outstanding - The number of outstanding shares of the security.",
+    "naics": "NAICS - The North American Industry Classification System code for the company.",
+    "siccd": "SIC - The Standard Industrial Classification code for the company.",
+}
+
+
 def pull_CRSP_stock(
-    start_date=None, end_date=None, freq="D", wrds_username=WRDS_USERNAME
-):
-    """Pull necessary CRSP monthly or daily stock data to
-    compute Fama-French factors. Use the new CIZ format.
+    wrds_username: str = WRDS_USERNAME,
+    start_date: pd.Timestamp = None,
+    end_date: pd.Timestamp = None,
+    freq: str = "D",
+    filter_by: str = None,  # "permno", "permco", or "ticker"
+    filter_value: Union[str, List[str], None] = None,
+    data_dir: Union[None, Path] = RAW_DATA_DIR,
+    file_name: str = None,
+    hash_file_name: bool = False,
+    file_type: str = None,
+) -> pd.DataFrame:
+    """
+    Pull CRSP monthly or daily stock data (new CIZ format) with optional filters and caching.
 
     Notes
     -----
@@ -99,341 +128,136 @@ def pull_CRSP_stock(
     For now, it's close enough to just let
     market_cap = mthprc * shrout
 
+    Parameters
+    ----------
+    wrds_username : str
+        WRDS username.
+    start_date : str, pd.Timestamp, or None
+        Start date (default '1959-01-01' if None).
+    end_date : str, pd.Timestamp, or None
+        End date (default is today's date if None).
+    freq : {'D', 'M'}
+        Frequency of the data. 'D' for daily, 'M' for monthly.
+    filter_by : {None, 'permno', 'permco', 'ticker'}, optional
+        If provided, the column to filter on.
+    filter_value : str or list of str, optional
+        If provided, the value(s) to filter. Must be used in conjunction with filter_by.
+    data_dir : pathlib.Path or None, optional
+        Directory for caching the data.
+    file_name : str, optional
+        If provided, save/read the data under this file name.
+    hash_file_name : bool, optional
+        If True, uses a hashed filename for cache. Otherwise uses a verbose name.
+    file_type : str, optional
+        File type for caching. Default 'parquet'.
+
+    Returns
+    -------
+    pd.DataFrame
+        CRSP stock data, with an added 'jdate' column set to end-of-month if freq='D' or 'M'.
     """
+    # Handle date defaults
     if start_date is None:
-        start_date = "01/01/1959"
+        start_date = "1959-01-01"
+    elif isinstance(start_date, (pd.Timestamp, datetime)):
+        start_date = start_date.strftime("%Y-%m-%d")
+
     if end_date is None:
-        end_date = datetime.today().strftime("%m/%d/%Y")
-    if freq == "M":
+        end_date = pd.Timestamp.now().strftime("%Y-%m-%d")
+    elif isinstance(end_date, (pd.Timestamp, datetime)):
+        end_date = end_date.strftime("%Y-%m-%d")
+
+    # Determine which CRSP table/columns to query
+    if freq.upper() == "M":
         table = "msf_v2"
         date_col = "mthcaldt"
-    elif freq == "D":
+        tot_ret_col = "mthret"
+        prc_ret_col = "mthretx"
+        prc_col = "mthprc"
+    elif freq.upper() == "D":
         table = "dsf_v2"
         date_col = "dlycaldt"
+        tot_ret_col = "dlyret"
+        prc_ret_col = "dlyretx"
+        prc_col = "dlyprc"
     else:
         raise ValueError("freq must be either 'D' or 'M'.")
-    
+
+    # Convert filter_value to a tuple for SQL
+    filter_value_tuple = _tickers_to_tuple(filter_value)
+
+    # Build or derive the cache file name
+    if file_name is None:
+        filters = {
+            "start_date": start_date,
+            "end_date": end_date}
+        if filter_by is not None and filter_value is not None:
+            filters[filter_by] = filter_value
+        filter_str = _flatten_dict_to_str(filters)
+        if hash_file_name:
+            cache_paths = _hash_cache_filename(f"crsp_{table}", filter_str, data_dir)
+        else:
+            cache_paths = _cache_filename(f"crsp_{table}", filter_str, data_dir)
+        
+        # Check if file is cached
+        cached_fp = _file_cached(cache_paths)
+    else:
+        if not any(file_name.endswith(f".{ft}") for ft in ["parquet", "csv", "zip"]):
+            cache_paths= [data_dir / f"{file_name}.{ft}" for ft in ["parquet", "csv", "zip"]]
+            cached_fp = _file_cached(cache_paths)
+        else:
+            cache_paths = None
+            cached_fp = Path(data_dir, file_name) if Path(data_dir, file_name).exists() else None
+            
+    if cached_fp:
+        print(f"Loading cached data from {cached_fp}")
+        return _read_cached_data(cached_fp)
+
+    # Build the SQL query
     sql_query = f"""
         SELECT 
-            permno, permco, mthcaldt, 
+            permno, permco, {date_col}, 
             issuertype, securitytype, securitysubtype, sharetype, 
             usincflg, 
             primaryexch, conditionaltype, tradingstatusflg,
-            mthret, mthretx, shrout, mthprc
-        FROM 
-            crsp.{table}
-        WHERE 
-            mthcaldt >= '{start_date}' AND mthcaldt <= '{end_date}'
-        """
+            {tot_ret_col} AS totret, 
+            {prc_ret_col} AS retx,
+            {prc_col} AS prc, 
+            shrout
+        FROM crsp.{table}
+        WHERE {date_col} >= '{start_date}' 
+          AND {date_col} <= '{end_date}'
+    """
 
+    # If filtering on permno/permco/ticker
+    if filter_by is not None and filter_value is not None:
+        filter_value_sql = _format_tuple_for_sql_list(filter_value_tuple)
+        sql_query += f" AND {filter_by} IN {filter_value_sql}"
+
+    # Query WRDS
     db = wrds.Connection(wrds_username=wrds_username)
     crsp = db.raw_sql(sql_query, date_cols=[date_col])
     db.close()
 
-    # change variable format to int
-    crsp[["permco", "permno"]] = crsp[["permco", "permno"]].astype(int)
+    # Clean up
+    crsp[["permno", "permco"]] = crsp[["permno", "permco"]].astype(int, errors="ignore")
 
-    # Line up date to be end of month
+    # For convenience, align to end-of-month
     crsp["jdate"] = crsp[date_col] + MonthEnd(0)
 
+    # Save to cache
+    cache_path = _save_cache_data(crsp, data_dir, cache_paths, file_name, file_type)
+    print(f"Saved data to {cache_path}")
+
     return crsp
 
-
-
-# ==============================================================================================
-# INDEX DATA
-# ==============================================================================================
-"""
-More information about the CRSP US Stock & Indexes Database can be found here:
-https://www.crsp.org/wp-content/uploads/guides/CRSP_US_Stock_&_Indexes_Database_Data_Descriptions_Guide.pdf
-"""
-
-def pull_CRSP_index(
-    start_date=None, end_date=None, wrds_username=WRDS_USERNAME
-):
-    """
-    Pulls the monthly CRSP index files from crsp_a_indexes.msix:
-    (Monthly)NYSE/AMEX/NASDAQ Capitalization Deciles, Annual Rebalanced (msix)
-    """
-    # Pull index files
-    if start_date is None:
-        start_date = "01/01/1959"
-    if end_date is None:
-        end_date = datetime.today().strftime("%m/%d/%Y")
-    query = f"""
-        SELECT * 
-        FROM crsp_a_indexes.msix
-        WHERE caldt BETWEEN '{start_date}' AND '{end_date}'
-    """
-    # with wrds.Connection(wrds_username=wrds_username) as db:
-    #     df = db.raw_sql(query, date_cols=["month", "caldt"])
-    db = wrds.Connection(wrds_username=wrds_username)
-    df = db.raw_sql(query, date_cols=["caldt"])
-    db.close()
-    return df
-
-
-def pull_constituents(
-    start_date=START_DATE, end_date=END_DATE, wrds_username=WRDS_USERNAME
-):
-    db = wrds.Connection(wrds_username=wrds_username)
-
-    df_constituents = db.raw_sql(f""" 
-    SELECT *
-    from crsp_m_indexes.dsp500list_v2 
-        WHERE caldt BETWEEN '{start_date}' AND '{end_date}'
-    """)
-
-    # Convert string columns to datetime if they aren't already
-    df_constituents["mbrstartdt"] = pd.to_datetime(df_constituents["mbrstartdt"])
-    df_constituents["mbrenddt"] = pd.to_datetime(df_constituents["mbrenddt"])
-
-    return df_constituents
-
-
-
-# ==============================================================================================
-# TREASURIES DATA
-# ==============================================================================================
-"""
-More information about the CRSP US Treasury Database can be found here:
-https://www.crsp.org/wp-content/uploads/guides/CRSP_US_Treasury_Database_Guide_for_SAS_ASCII_EXCEL_R.pdf
-"""
-
-def pull_CRSP_treasuries(
-    start_date=START_DATE, end_date=END_DATE, wrds_username=WRDS_USERNAME, include_descr=True
-):
-    """
-    Pulls the CRSP treasuries issue descriptions and daily time series quotes from crsp_m_treasuries.tfz_dly
-    https://wrds-www.wharton.upenn.edu/pages/get-data/center-research-security-prices-crsp/monthly-update/treasuries/daily-time-series/
-    """
-    query = f"""
-        SELECT *
-        FROM crsp_m_treasuries.tfz_dly
-        WHERE caldt >= '{start_date}' AND caldt <= '{end_date}'
-    """
-    db = wrds.Connection(wrds_username=wrds_username)
-    df = db.raw_sql(query, date_cols=["caldt"])
-
-    if include_descr:
-        keys = tuple(df['kytreasno'])
-        query = f"""
-            SELECT *
-            FROM crsp_m_treasuries.tfz_iss WHERE kytreasno IN {keys}
-        """
-        df_info = db.raw_sql(query)
-        df = df.merge(df_info, on='kytreasno')
-    
-    db.close()
-
-    return df
-
-
-def pull_CRSP_treasury_info(keys_list: List[int] = None,
-                            wrds_username: str = WRDS_USERNAME):
-    """
-    Pulls the CRSP treasuries issue descriptions from crsp_m_treasuries.tfz_iss
-    https://wrds-www.wharton.upenn.edu/pages/get-data/center-research-security-prices-crsp/monthly-update/treasuries/daily-time-series/
-    """
-    if keys_list is not None:
-        keys = tuple(keys_list)
-        query = f"""
-            SELECT *
-            FROM crsp_m_treasuries.tfz_iss WHERE kytreasno IN {keys}
-        """
-    else:
-        query = f"""
-            SELECT *
-            FROM crsp_m_treasuries.tfz_iss
-        """
-    db = wrds.Connection(wrds_username=wrds_username)
-    df = db.raw_sql(query)
-    db.close()
-
-    return df
-
-
-def pull_CRSP_yield_curve(
-    start_date=START_DATE, end_date=END_DATE, freq='D', wrds_username=WRDS_USERNAME
-):
-    """
-    Pulls the daily CRSP yield curve data from crsp_m_treasuries.tfz_dly_ft.
-    Highlight the performance of single treasury issues at fixed maturity horizons.
-    Seven groups of indexes: 30-year, 20-year, 10-year, 7-year, 5-year, 2-year, or 1-year target maturity.
-    Index creates a sophisticated bond yield curve, allowing the selection of data items referenced by returns, prices and duration.
-
-    https://wrds-www.wharton.upenn.edu/data-dictionary/crsp_m_treasuries/tfz_dly_ft/
-    """
-    if freq == "D":
-        table = "tfz_dly_ft"
-    elif freq == "M":
-        table = "tfz_mth_ft"
-    else:
-        raise ValueError("freq must be either 'D' or 'M'.")
-    
-    query = f"""
-        SELECT *
-        FROM crsp_m_treasuries.{table}
-        WHERE caldt >= '{start_date}' AND caldt <= '{end_date}'
-    """
-    db = wrds.Connection(wrds_username=wrds_username)
-    df = db.raw_sql(query, date_cols=["caldt"])
-    db.close()
-    df = df.pivot_table(index='caldt',values='tdytm', columns='kytreasnox')
-    df = df.rename(columns={2000003:1, 2000004:2, 2000005:5, 2000006:7, 2000007:10, 2000008:20, 2000009:30})
-    df.columns = [1,2,5,7,10,20,30]
-
-    return df
-
-
-def pull_CRSP_zero_bonds(
-    start_date=START_DATE, end_date=END_DATE, wrds_username=WRDS_USERNAME
-):
-    """
-    Pulls the monthly CRSP zero coupon bonds (Fama Bliss) from crsp_m_treasuries.tfz_dly_zc.
-
-    Data begin in 1952
-    Contain artificial discount bonds with one to five years to maturity, constructed after first extracting the term structure from a filtered subset of the available bonds.
-
-    It gives prices on **zero coupon bonds** with maturities of 1 through 5 years.
-    * These are prices per $1 face value on bonds that only pay principal.
-    * Such bonds can be created from treasuries by stripping out their coupons.
-    * In essence, you can consider these prices as the discount factors $Z$, for maturity intervals 1 through 5 years.
-
-    To calculate the spot rates, you can use the formula:
-    px = pull_CRSP_zero_bonds(wrds_username=WRDS_USERNAME)
-    spots = -np.log(px)/px.columns
-
-    https://wrds-www.wharton.upenn.edu/pages/get-data/center-research-security-prices-crsp/monthly-update/treasuries/fama-bliss-discount-bonds-monthly-only/
-    """
-
-    query = f"""
-        SELECT *
-        FROM crsp_m_treasuries.tfz_mth_fb
-        WHERE caldt >= '{start_date}' AND caldt <= '{end_date}'
-    """
-    db = wrds.Connection(wrds_username=wrds_username)
-    df = db.raw_sql(query, date_cols=["caldt"])
-    db.close()
-
-    fb = fb.rename(columns={'mcaldt':'date','tmnomprc':'price','tmytm':'yld'})
-    fb = fb.pivot_table(values='price',index='date',columns='kytreasnox')
-    fb = fb.rename(columns={2000047:1, 2000048:2, 2000049:3, 2000050:4, 2000051:5})
-    fb.columns.name = 'maturity'
-    
-    return df
-
-
-def risk_CRSP_free_rate(start_date=START_DATE, end_date=END_DATE, freq="D", wrds_username=WRDS_USERNAME):
-    """
-    Contain one- and three-month risk free rates for use in pricing and macroeconomic models.
-    Monthly:
-        Begin in 1925
-        Contain one- and three-month risk free rates for use in pricing and macroeconomic models
-    Daily:
-        Begin in 1961
-        Four-week, 13-week, and 26-week rates
-        Provides lending and borrowing rates derived from bid, ask, and bid/ask average prices.
-    """
-    if freq == "D":
-        table = "tfz_dly_rf2"
-        date_col = "caldt"
-        value_col = "tdyld"
-        col_dict = {2000061:'rf_4w',2000062:'rf_13w', 2000063:'rf_26w'}
-    elif freq == "M":
-        table = "tfz_mth_rf"
-        date_col = "mcaldt"
-        value_col = "tmytm"
-        col_dict = {2000001:'rf_1m',2000002:'rf_3m'}
-    else:
-        raise ValueError("freq must be either 'D' or 'M'.")
-    
-    query = f"""
-        SELECT *
-        FROM crsp_m_treasuries.{table}
-        WHERE {date_col} >= '{start_date}' AND {date_col} <= '{end_date}'
-    """
-    db = wrds.Connection(wrds_username=wrds_username)
-    df = db.raw_sql(query, date_cols=[date_col])
-    db.close()
-
-    df = df.pivot_table(index=date_col,values=value_col, columns='kytreasnox')
-    df = df.rename(columns=col_dict)
-
-    return df
-    
         
-# ==============================================================================================
-# LOAD SAVED DATA
-# ==============================================================================================
-
-def load_CRSP_stock(data_dir=RAW_DATA_DIR, freq="D"):
-    if freq == "D":
-        path = Path(data_dir) / f"CRSP_stock_D.parquet"
-    elif freq == "M":
-        path = Path(data_dir) / f"CRSP_stock_M.parquet"
-    else:
-        raise ValueError("freq must be either 'D' or 'M'.")
-    crsp = pd.read_parquet(path)
-    return crsp
-
-
-def load_CRSP_index(data_dir=RAW_DATA_DIR):
-    return pd.read_parquet(data_dir / "CRSP_MSIX.parquet")
-
-def load_CRSP_index_constituents(data_dir=RAW_DATA_DIR):
-    return pd.read_parquet(data_dir / "df_sp500_constituents.parquet")
-
-def load_CRSP_treasuries(data_dir=RAW_DATA_DIR):
-    return pd.read_parquet(data_dir / "CRSP_treasuries.parquet")
-
-def load_CRSP_yield_curve(data_dir=RAW_DATA_DIR):
-    return pd.read_parquet(data_dir / "CRSP_yield_curve.parquet")
-
-def load_CRSP_zero_bonds(data_dir=RAW_DATA_DIR):
-    return pd.read_parquet(data_dir / "CRSP_zero_bonds.parquet")
-
-def load_CRSP_treasury_info(data_dir=RAW_DATA_DIR):
-    return pd.read_parquet(data_dir / "CRSP_treasuries_info.parquet")
 
 def _demo():
-    crsp_d = load_CRSP_stock(data_dir=RAW_DATA_DIR, freq="D")
-    crsp_m = load_CRSP_stock(data_dir=RAW_DATA_DIR, freq="M")
-    df_msix = load_CRSP_index(data_dir=RAW_DATA_DIR)
-    constituents = load_CRSP_index_constituents(data_dir=RAW_DATA_DIR)
-    treasuries = load_CRSP_treasuries(data_dir=RAW_DATA_DIR)
-    treasury_info = load_CRSP_treasury_info(data_dir=RAW_DATA_DIR)
-    yield_curve = load_CRSP_yield_curve(data_dir=RAW_DATA_DIR)
-    zero_bonds = load_CRSP_zero_bonds(data_dir=RAW_DATA_DIR)
-
+    crsp_d = load_cache_data(data_dir=RAW_DATA_DIR, file_name="CRSP_stock_d.parquet")
+    crsp_m = load_cache_data(data_dir=RAW_DATA_DIR, file_name="CRSP_stock_m.parquet")
 
 if __name__ == "__main__":
 
-    crsp_m = pull_CRSP_stock(start_date=START_DATE, end_date=END_DATE, freq='M', wrds_username=WRDS_USERNAME)
-    crsp_m.to_parquet(RAW_DATA_DIR / "CRSP_stock_m.parquet")
-
-    crsp_d = pull_CRSP_stock(start_date=START_DATE, end_date=END_DATE, freq='D', wrds_username=WRDS_USERNAME)
-    crsp_d.to_parquet(RAW_DATA_DIR / "CRSP_stock_d.parquet")
-
-    df_msix = pull_CRSP_index(start_date=START_DATE, end_date=END_DATE, wrds_username=WRDS_USERNAME)
-    df_msix.to_parquet(RAW_DATA_DIR / "CRSP_MSIX.parquet")
-
-    constituents = pull_constituents(start_date=START_DATE, end_date=END_DATE, wrds_username=WRDS_USERNAME)
-    constituents.to_parquet(RAW_DATA_DIR / "df_sp500_constituents.parquet")
-
-    treasuries = pull_CRSP_treasuries(start_date=START_DATE, end_date=END_DATE, wrds_username=WRDS_USERNAME)
-    treasuries.to_parquet(RAW_DATA_DIR / "CRSP_treasuries.parquet")
-
-    treasury_info = pull_CRSP_treasury_info(wrds_username=WRDS_USERNAME)
-    treasury_info.to_parquet(RAW_DATA_DIR / "CRSP_treasuries_info.parquet")
-
-    yield_curve_m = pull_CRSP_yield_curve(start_date=START_DATE, end_date=END_DATE, freq='M', wrds_username=WRDS_USERNAME)
-    yield_curve_m.to_parquet(RAW_DATA_DIR / "CRSP_yield_curve_m.parquet")
-
-    yield_curve_d = pull_CRSP_yield_curve(start_date=START_DATE, end_date=END_DATE, freq='D', wrds_username=WRDS_USERNAME)
-    yield_curve_d.to_parquet(RAW_DATA_DIR / "CRSP_yield_curve_d.parquet")
-
-    zero_bonds = pull_CRSP_zero_bonds(start_date=START_DATE, end_date=END_DATE, wrds_username=WRDS_USERNAME)
-    zero_bonds.to_parquet(RAW_DATA_DIR / "CRSP_zero_bonds.parquet")
-
-
+    crsp_d = pull_CRSP_stock(start_date=START_DATE, end_date=END_DATE, freq='D', wrds_username=WRDS_USERNAME, file_name="CRSP_stock_d.parquet")
+    crsp_m = pull_CRSP_stock(start_date=START_DATE, end_date=END_DATE, freq='M', wrds_username=WRDS_USERNAME, file_name="CRSP_stock_m.parquet")

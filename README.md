@@ -29,3 +29,22 @@ Finally, you can then run
 doit
 ```
 And that's it!
+
+
+### General Directory Structure
+
+ - Folders that start with `_` are automatically generated. The entire folder should be able to be deleted, because the code can be run again, which would again generate all of the contents. 
+
+ - Anything in the `_data` folder (or your own RAW_DATA_DIR) or in the `_output` folder should be able to be recreated by running the code and can safely be deleted.
+
+ - The `assets` folder is used for things like hand-drawn figures or other pictures that were not generated from code. These things cannot be easily recreated if they are deleted.
+
+ - `_output` contains the .py generated from jupyter notebooks, and the jupyter notebooks with outputs, both in .md and in .html
+ 
+ - `/src` contains the actual code. All notebooks in this folder will be stored cleaned from outputs (after running doit). That is in order to avoid unecessary commits from changes from simply opening or running the notebook.
+
+ - The `data_manual` (DATA_MANUAL_DIR) is for data that cannot be easily recreated. 
+
+ - `doit` Python module is used as the task runner. It works like `make` and the associated `Makefile`s. To rerun the code, install `doit` (https://pydoit.org/) and execute the command `doit` from the `src` directory. Note that doit is very flexible and can be used to run code commands from the command prompt, thus making it suitable for projects that use scripts written in multiple different programming languages.
+
+ - `.env` file is the container for absolute paths that are private to each collaborator in the project. You can also use it for private credentials, if needed. It should not be tracked in Git.

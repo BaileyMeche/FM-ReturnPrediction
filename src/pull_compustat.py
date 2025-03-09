@@ -1,7 +1,6 @@
 """
 This module pulls and saves data on fundamentals from CRSP and Compustat.
-It pulls fundamentals data from Compustat needed to calculate
-book equity, and the data needed from CRSP to calculate market equity.
+The functions implement caching to avoid repeated downloads, especially during development.
 
 Note: This code uses the new CRSP CIZ format. Information
 about the differences between the SIZ and CIZ format can be found here:
@@ -26,11 +25,24 @@ https://wrds-www.wharton.upenn.edu/documents/400/CRSP_Programmers_Guide.pdf
 
 """
 from pathlib import Path
+from typing import Union, List
 
 import pandas as pd
 import wrds
 
 from settings import config
+from utils import (
+    _cache_filename,
+    _hash_cache_filename,
+    _file_cached,
+    _read_cached_data,
+    _write_cache_data,
+    _flatten_dict_to_str,
+    _tickers_to_tuple,
+    _format_tuple_for_sql_list,
+    load_cache_data,
+    _save_cache_data
+)
 
 # ==============================================================================================
 # Global Configuration
@@ -41,18 +53,39 @@ WRDS_USERNAME = config("WRDS_USERNAME")
 START_DATE = config("START_DATE")
 END_DATE = config("END_DATE")
 
+
 # ==============================================================================================
-# Compustat Data Functions
+# Compustat Data
 # ==============================================================================================
 
 description_compustat = {
     "gvkey": "Global Company Key",
+    "tic": "Ticker Symbol",
     "datadate": "Data Date",
+    "fyear": "Fiscal Year",
     "at": "Assets - Total",
     "sale": "Sales/Revenue",
     "cogs": "Cost of Goods Sold",
     "xsga": "Selling, General and Administrative Expense",
+    "oibdp": "Operating Income Before Depreciation",
+    "ebitda": "Earnings Before Interest, Taxes, Depreciation and Amortization",
     "xint": "Interest Expense, Net",
+    "gliv": "Gains/Losses on investments",
+    "uniami": "Net Income before Extraordinary Items and after Noncontrolling Interest",
+    "ni": "Net Income (Loss)",
+    "niadj": "Net Income Adjusted for Common/Ordinary Stock (Capital) Equivalents",
+    "epsfi": "Earnings Per Share (Diluted) - Including Extraordinary Items",
+    "epsfx": "Earnings Per Share (Diluted) - Excluding Extraordinary Items",
+    "epspfi": "Earnings Per Share (Basic) - Including Extraordinary Items",
+    "epspx": "Earnings Per Share (Basic) - Excluding Extraordinary Items",
+    "dvpd": "Cash Dividends Paid",
+    "dvt": "Cash Dividends Paid", 
+    "csho": "Common Shares Outstanding",
+    "cshpri": "Common Shares Used to Calculate Earnings Per Share - Basic", 
+    "dltt": "Long-Term Debt - Total",
+    "lct": "Current Debt - Total",
+    "che": "Cash and Short-Term Investments",
+    "sich": "SIC Code - Standard Industrial Classification Code - Historical",
     "pstkl": "Preferred Stock - Liquidating Value",
     "txditc": "Deferred Taxes and Investment Tax Credit",
     "pstkrv": "Preferred Stock - Redemption Value",
@@ -68,17 +101,112 @@ description_compustat = {
 }
 
 
-def pull_Compustat(wrds_username=WRDS_USERNAME, vars_str=None):
+def pull_Compustat(
+        wrds_username: str = WRDS_USERNAME,
+        gvkey: Union[str, List] = None,
+        vars_str: Union[str,List] = None,
+        start_date: str = None,
+        end_date: str = None,
+        data_dir: Union[None, Path] = RAW_DATA_DIR,
+        file_name: str = None,
+        hash_file_name: bool = False,
+        file_type: str = None,    
+    ) -> pd.DataFrame:
     """
     See description_Compustat for a description of the variables.
-    Annual Compustat fundamental data.
+    Pull Annual Compustat fundamental data with caching
+
+    Parameters
+    ----------
+    wrds_username : str
+        WRDS username.
+    gvkey : str or list, optional
+        Global Company Key. If None, all companies are pulled. The default is None.
+    vars_str : str or list, optional
+        List of variables to pull from Compustat. If None, all variables are pulled. The default is None.
+    start_date : str, optional
+        Start date for the data. The default is None.
+    end_date : str, optional
+        End date for the data. The default is None.
+    data_dir : Path, optional
+        Directory to save the data. The default is RAW_DATA_DIR.
+    file_name : str, optional
+        File name to save the data. The default is None.
+         hash_file_name : bool, optional
+        If True, uses a hashed filename for cache. Otherwise uses a verbose name. The default is False.
+    file_type : str, optional
+        File type to save the data. The default is "parquet".
+    
+    Returns
+    -------
+    comp : pd.DataFrame
+        Compustat data.
+
     """
+    
+    # Parse dates:
+    if start_date is not None:
+        start_date = start_date.strftime("%Y-%m-%d")
+    else:
+        start_date = '1951-01-01'
+    if end_date is not None:
+        end_date = end_date.strftime("%Y-%m-%d")
+    else:
+        end_date = pd.Timestamp.now().strftime("%Y-%m-%d")
+
     if vars_str is not None:
         vars_str = ", ".join(vars_str)
     else: 
         vars_str = "gvkey, datadate, at, sale, cogs, xsga, xint, pstkl, txditc, pstkrv, seq, pstk, ni, sich, dp, ebit"
+    
+    # Convert filter_value to a tuple for SQL
+    gvkey_tuple = _tickers_to_tuple(gvkey)
 
-    sql_query = """
+    if file_name is None:
+        filters = {
+            "vars_str": vars_str,
+            "start_date": start_date,
+            "end_date": end_date}
+        if gvkey_tuple is not None:
+            filters["gvkey"] = gvkey_tuple
+        file_name = _flatten_dict_to_str(filters)
+        if hash_file_name:
+            cache_paths = _hash_cache_filename("comp_funda", filter_str, data_dir)
+        else:
+            cache_paths = _cache_filename("comp_funda", filter_str, data_dir)
+        
+        # Check if file is cached
+        cached_fp = _file_cached(cache_paths)
+    else:
+        if not any(file_name.endswith(f".{ft}") for ft in ["parquet", "csv", "zip"]):
+            cache_paths= [data_dir / f"{file_name}.{ft}" for ft in ["parquet", "csv", "zip"]]
+            cached_fp = _file_cached(cache_paths)
+        else:
+            cache_paths = None
+            cached_fp = Path(data_dir, file_name) if Path(data_dir, file_name).exists() else None
+        
+    if cached_fp:
+        print(f"Loading cached data from {cached_fp}")
+        df_cached = _read_cached_data(cached_fp)
+        return df_cached
+
+    if gvkey is None:
+        sql_query = f"""
+            SELECT 
+                {vars_str}
+            FROM 
+                comp.funda
+            WHERE 
+                indfmt='INDL' AND -- industrial reporting format (not financial services format)
+                datafmt='STD' AND -- only standardized records
+                popsrc='D' AND -- only from domestic sources
+                consol='C' AND -- consolidated financial statements
+                datadate >= '{start_date}'AND 
+                datadate <= '{end_date}'
+            """
+    else:
+        gvkey_filter = _format_tuple_for_sql_list(gvkey_tuple)
+        sql_query = f"""
         SELECT 
             {vars_str}
         FROM 
@@ -88,35 +216,22 @@ def pull_Compustat(wrds_username=WRDS_USERNAME, vars_str=None):
             datafmt='STD' AND -- only standardized records
             popsrc='D' AND -- only from domestic sources
             consol='C' AND -- consolidated financial statements
-            datadate >= '01/01/1959'
+            datadate >= '{start_date}'AND 
+            datadate <= '{end_date}' AND
+            gvkey IN {gvkey_filter}
         """
+
     # with wrds.Connection(wrds_username=wrds_username) as db:
     #     comp = db.raw_sql(sql_query, date_cols=["datadate"])
     db = wrds.Connection(wrds_username=wrds_username)
     comp = db.raw_sql(sql_query, date_cols=["datadate"])
     db.close()
 
-    comp["year"] = comp["datadate"].dt.year
+    # Save to cache
+    cache_path = _save_cache_data(comp, data_dir, cache_paths, file_name, file_type)
+    print(f"Saved data to {cache_path}")
+
     return comp
-
-
-description_crsp = {
-    "permno": "Permanent Number - A unique identifier assigned by CRSP to each security.",
-    "permco": "Permanent Company - A unique company identifier assigned by CRSP that remains constant over time for a given company.",
-    "mthcaldt": "Calendar Date - The date for the monthly data observation.",
-    "issuertype": "Issuer Type - Classification of the issuer, such as corporate or government.",
-    "securitytype": "Security Type - General classification of the security, e.g., stock or bond.",
-    "securitysubtype": "Security Subtype - More specific classification of the security within its type.",
-    "sharetype": "Share Type - Classification of the equity share type, e.g., common stock, preferred stock.",
-    "usincflg": "U.S. Incorporation Flag - Indicator of whether the company is incorporated in the U.S.",
-    "primaryexch": "Primary Exchange - The primary stock exchange where the security is listed.",
-    "conditionaltype": "Conditional Type - Indicator of any conditional issues related to the security.",
-    "tradingstatusflg": "Trading Status Flag - Indicator of the trading status of the security, e.g., active, suspended.",
-    "mthret": "Monthly Return - The total return of the security for the month, including dividends.",
-    "mthretx": "Monthly Return Excluding Dividends - The return of the security for the month, excluding dividends.",
-    "shrout": "Shares Outstanding - The number of outstanding shares of the security.",
-    "mthprc": "Monthly Price - The price of the security at the end of the month.",
-}
 
 
 description_CRSP_Comp_link = {
@@ -129,46 +244,110 @@ description_CRSP_Comp_link = {
 }
 
 
-def pull_CRSP_Comp_link_table(wrds_username=WRDS_USERNAME):
+def pull_CRSP_Comp_link_table(
+    wrds_username: str = WRDS_USERNAME,
+    gvkey: Union[str, List[str], None] = None,
+    data_dir: Union[None, Path] = RAW_DATA_DIR,
+    file_name: str = None,
+    hash_file_name: bool = False,
+    file_type: str = None,    
+) -> pd.DataFrame:
     """ 
     Pull the CRSP-Compustat link table.
     https://wrds-www.wharton.upenn.edu/pages/wrds-research/database-linking-matrix/linking-crsp-with-compustat/
+    
+    Parameters
+    ----------
+    wrds_username : str
+        WRDS username.
+    gvkey : str or list of str, optional
+        Filter by gvkey. If None, no gvkey filter is applied.
+    data_dir : pathlib.Path or None, optional
+        Directory for caching the data. If None, no caching is performed.
+    file_name : str, optional
+        If provided, save/read the data under this file name. Otherwise,
+        a hashed name is generated from the function filters.
+    hash_file_name : bool, optional
+        If True, uses a hashed filename for cache. Otherwise uses a verbose name. The default is False.
+    file_type : str, optional
+        File type to save the data. The default is "parquet".
+
+    Returns
+    -------
+    pd.DataFrame
+        The CRSP-Compustat link table with any specified filters applied.
+
     """
-    sql_query = """
+    # Convert filter_value to a tuple for SQL
+    gvkey_tuple = _tickers_to_tuple(gvkey)
+
+    # Build or derive the cache file name
+    if file_name is None:
+        if gvkey_tuple is not None:
+            filters = {"gvkey": gvkey_tuple}
+        else:
+            filters = {}
+        filter_str = _flatten_dict_to_str(filters)
+        if hash_file_name:
+            cache_paths = _hash_cache_filename("crsp_comp_link_table", filter_str, data_dir)
+        else:
+            cache_paths = _cache_filename("crsp_comp_link_table", filter_str, data_dir)
+        
+        # Check if file is cached
+        cached_fp = _file_cached(cache_paths)
+    else:
+        if not any(file_name.endswith(f".{ft}") for ft in ["parquet", "csv", "zip"]):
+            cache_paths= [data_dir / f"{file_name}.{ft}" for ft in ["parquet", "csv", "zip"]]
+            cached_fp = _file_cached(cache_paths)
+        else:
+            cache_paths = None
+            cached_fp = Path(data_dir, file_name) if Path(data_dir, file_name).exists() else None
+
+    if cached_fp:
+        print(f"Loading cached data from {cached_fp}")
+        return _read_cached_data(cached_fp)
+
+    # Build the SQL query
+    base_sql = """
         SELECT 
             gvkey, lpermno AS permno, linktype, linkprim, linkdt, linkenddt
         FROM 
             crsp.ccmxpf_linktable
         WHERE 
-            substr(linktype,1,1)='L' AND 
-            (linkprim ='C' OR linkprim='P')
-        """
+            substr(linktype,1,1)='L'
+            AND (linkprim ='C' OR linkprim='P')
+    """
+
+    if gvkey_tuple is not None:
+        gvkey_filter = _format_tuple_for_sql_list(gvkey_tuple)
+        base_sql += f" AND gvkey IN {gvkey_filter}"
+
+    # Connect to WRDS, run query
     db = wrds.Connection(wrds_username=wrds_username)
-    ccm = db.raw_sql(sql_query, date_cols=["linkdt", "linkenddt"])
+    ccm = db.raw_sql(base_sql, date_cols=["linkdt", "linkenddt"])
     db.close()
-    return ccm
 
+    # Save to cache
+    cache_path = _save_cache_data(ccm, data_dir, cache_paths, file_name, file_type)
+    print(f"Saved data to {cache_path}")
 
-def load_Compustat(data_dir=RAW_DATA_DIR):
-    path = Path(data_dir) / "Compustat.parquet"
-    comp = pd.read_parquet(path)
-    return comp
-
-
-def load_CRSP_Comp_Link_Table(data_dir=RAW_DATA_DIR):
-    path = Path(data_dir) / "CRSP_Comp_Link_Table.parquet"
-    ccm = pd.read_parquet(path)
     return ccm
 
 
 def _demo():
-    comp = load_Compustat(data_dir=RAW_DATA_DIR)
-    ccm = load_CRSP_Comp_Link_Table(data_dir=RAW_DATA_DIR)
+    comp = load_cache_data(data_dir=RAW_DATA_DIR, file_name="Compustat.parquet")
+    ccm = load_cache_data(data_dir=RAW_DATA_DIR, file_name="CRSP_Comp_Link_Table.parquet")
 
 
 if __name__ == "__main__":
-    comp = pull_Compustat(wrds_username=WRDS_USERNAME)
-    comp.to_parquet(RAW_DATA_DIR / "Compustat.parquet")
+    comp = pull_Compustat(wrds_username=WRDS_USERNAME,
+                          start_date=START_DATE,
+                          end_date=END_DATE,
+                          file_name="Compustat.parquet",
+                          )
 
-    ccm = pull_CRSP_Comp_link_table(wrds_username=WRDS_USERNAME)
-    ccm.to_parquet(RAW_DATA_DIR / "CRSP_Comp_Link_Table.parquet")
+    ccm = pull_CRSP_Comp_link_table(wrds_username=WRDS_USERNAME,
+                          start_date=START_DATE,
+                          end_date=END_DATE,
+                          file_name="CRSP_Comp_Link_Table.parquet"
+                          )
