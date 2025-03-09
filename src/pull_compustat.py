@@ -63,12 +63,12 @@ description_compustat = {
     "tic": "Ticker Symbol",
     "datadate": "Data Date",
     "fyear": "Fiscal Year",
-    "at": "Assets - Total",
     "sale": "Sales/Revenue",
     "cogs": "Cost of Goods Sold",
     "xsga": "Selling, General and Administrative Expense",
     "oibdp": "Operating Income Before Depreciation",
     "ebitda": "Earnings Before Interest, Taxes, Depreciation and Amortization",
+    "dp": "Depreciation and Amortization",
     "xint": "Interest Expense, Net",
     "gliv": "Gains/Losses on investments",
     "uniami": "Net Income before Extraordinary Items and after Noncontrolling Interest",
@@ -84,7 +84,10 @@ description_compustat = {
     "cshpri": "Common Shares Used to Calculate Earnings Per Share - Basic", 
     "dltt": "Long-Term Debt - Total",
     "lct": "Current Debt - Total",
+    "dlc": "Debt in Current Liabilities - Total",
+    "at": "Assets - Total",
     "che": "Cash and Short-Term Investments",
+    "act": "Current Assets - Total",
     "sich": "SIC Code - Standard Industrial Classification Code - Historical",
     "pstkl": "Preferred Stock - Liquidating Value",
     "txditc": "Deferred Taxes and Investment Tax Credit",
@@ -157,7 +160,12 @@ def pull_Compustat(
     if vars_str is not None:
         vars_str = ", ".join(vars_str)
     else: 
-        vars_str = "gvkey, datadate, at, sale, cogs, xsga, xint, pstkl, txditc, pstkrv, seq, pstk, ni, sich, dp, ebit"
+        vars_str = ("gvkey, datadate, fyear, sale AS sales, ni AS earnings, at AS assets, "
+                    "(act - che) - lct - dp AS accruals, "
+                    "act - che AS non_cash_current_assets,"
+                    "lct,"
+                    "dltt + dlc AS total_debt,"
+                    "dp AS depreciation")
     
     # Convert filter_value to a tuple for SQL
     gvkey_tuple = _tickers_to_tuple(gvkey)
