@@ -119,6 +119,8 @@ def pull_Compustat(
     See description_Compustat for a description of the variables.
     Pull Annual Compustat fundamental data with caching
 
+    https://wrds-www.wharton.upenn.edu/pages/get-data/compustat-capital-iq-standard-poors/compustat/north-america-daily/fundamentals-annual/
+
     Parameters
     ----------
     wrds_username : str
