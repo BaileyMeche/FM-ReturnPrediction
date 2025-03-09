@@ -57,8 +57,8 @@ d["BASE_DIR"] = Path(__file__).absolute().parent.parent
 ## Other .env variables
 d["WRDS_USERNAME"] = _config("WRDS_USERNAME", default="")
 d["NASDAQ_API_KEY"] = _config("NASDAQ_API_KEY", default="")
-d["START_DATE"] = _config("START_DATE", default="1913-01-01", cast=to_datetime)
-d["END_DATE"] = _config("END_DATE", default="2024-12-31", cast=to_datetime)
+d["START_DATE"] = _config("START_DATE", default="1964-01-01", cast=to_datetime)
+d["END_DATE"] = _config("END_DATE", default="2013-12-31", cast=to_datetime)
 d["USER"] = _config("USER", default="")
 
 ## Paths
@@ -66,9 +66,7 @@ d["DATA_DIR"] = if_relative_make_abs(_config('DATA_DIR', default=Path('_data'), 
 d["RAW_DATA_DIR"] = Path(d["DATA_DIR"] / "raw")
 d["PROCESSED_DATA_DIR"] = Path(d["DATA_DIR"] / "processed")
 d["MANUAL_DATA_DIR"] = Path(d["DATA_DIR"] / "manual")
-d["LOG_DIR"] = if_relative_make_abs(_config('LOG_DIR', default=Path('logs'), cast=Path))
 d["OUTPUT_DIR"] = if_relative_make_abs(_config('OUTPUT_DIR', default=Path('_output'), cast=Path))
-d["PUBLISH_DIR"] = if_relative_make_abs(_config('PUBLISH_DIR', default=Path('docs'), cast=Path))
 
 
 def config(*args, **kwargs):
