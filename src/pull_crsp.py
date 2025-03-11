@@ -249,7 +249,7 @@ def pull_CRSP_stock(
     cache_path = _save_cache_data(crsp, data_dir, cache_paths, file_name, file_type)
     print(f"Saved data to {cache_path}")
 
-    return crsp
+    return subset_CRSP_to_common_stock_and_exchanges(crsp)
 
 def subset_CRSP_to_common_stock_and_exchanges(crsp):
     """Subset to common stock universe and
