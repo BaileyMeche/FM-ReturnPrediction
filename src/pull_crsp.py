@@ -251,6 +251,49 @@ def pull_CRSP_stock(
 
     return crsp
 
+def subset_CRSP_to_common_stock_and_exchanges(crsp):
+    """Subset to common stock universe and
+    stocks traded on NYSE, AMEX and NASDAQ.
+
+    NOTE:
+        With the new CIZ format, it is not necessary to apply delisting
+        returns, as they are already applied.
+    """
+    # In the old SIZ format, this would condition on shrcd = 10 or 11
+
+    ## Select common stock universe
+    ##
+    # sharetype=='NS': Filters for securities where the 'Share Type' is
+    # "Not specified". This is confusing. See here:
+    # https://wrds-www.wharton.upenn.edu/pages/support/manuals-and-overviews/crsp/stocks-and-indices/crsp-stock-and-indexes-version-2/crsp-ciz-faq/#replicating-common-tasks
+
+    # securitytype=='EQTY': Selects only securities classified as 'EQTY'
+
+    # securitysubtype=='COM': Narrows down to securities with a 'Security Subtype'
+    # of 'COM', suggesting these are common stocks.
+
+    # usincflg=='Y': Includes only securities issued by companies incorporated in
+    # the U.S., as indicated by the 'U.S. Incorporation Flag'.
+
+    # issuertype.isin(['ACOR', 'CORP']): Further filters securities to those issued
+    # by entities classified as either 'ACOR' (Asset-Backed Corporate)
+    # or 'CORP' (Corporate), based on the 'Issuer Type' classification.
+
+    mask_filter = (crsp["conditionaltype"] == "RW") & (crsp["tradingstatusflg"] == "A") & \
+            (crsp["sharetype"] == "NS") & (crsp["securitytype"] == "EQTY") & \
+            (crsp["securitysubtype"] == "COM") & (crsp["usincflg"] == "Y") & \
+            (crsp["issuertype"].isin(["ACOR", "CORP"]))
+
+    crsp = crsp[mask_filter]
+
+    ## Select stocks traded on NYSE, AMEX and NASDAQ
+    ##
+    ## Again, see https://wrds-www.wharton.upenn.edu/pages/support/manuals-and-overviews/crsp/stocks-and-indices/crsp-stock-and-indexes-version-2/crsp-ciz-faq/#replicating-common-tasks
+    
+    mask_filter_exchanges = crsp["primaryexch"].isin(["N", "A", "Q"])
+    crsp = crsp[mask_filter_exchanges]
+
+    return crsp
         
 
 def _demo():
