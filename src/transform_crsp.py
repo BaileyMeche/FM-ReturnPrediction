@@ -70,9 +70,40 @@ def calculate_book_market_ratio(crsp):
 
 
 
-def get_company_subsets(crsp):
-    #We use book-to-market ratios for Fama and French's (1993) size- and value-sorted portfolios (in which U.S. stocks are divided into 6, 25, or 100 portfolios).
-    return
+def get_subsets(crsp):
+    """
+    Return a dictionary of permco subsets (all, all-but-tiny, large) based on
+    the book-to-market (BM) ratio. Uses 6% and 25% BM cutoffs.
+    
+    """
+    df = calculate_book_market_ratio(crsp)
+
+    # Keep only rows where BM is not missing (or negative if that matters)
+    df = df.dropna(subset=["bm"])
+    
+    # Compute the 6% and 25% percentiles for BM
+    bm_6pct = df["bm"].quantile(0.06)
+    bm_25pct = df["bm"].quantile(0.25)
+
+    # Subset: all_stocks (every permco in data)
+    all_stocks = df["permco"].unique()
+
+    # Subset: all_but_tiny (BM >= 6th percentile)
+    all_but_tiny = df.loc[df["bm"] >= bm_6pct, "permco"].unique()
+
+    # Subset: large_stocks (BM >= 25th percentile)
+    large_stocks = df.loc[df["bm"] >= bm_25pct, "permco"].unique()
+
+    # Build dictionary of subsets. Converting each subset to tuple to match
+    # your request for “(some tuple)”.
+    subset_permco = {
+        "all_stocks": tuple(all_stocks),
+        "all_but_tiny": tuple(all_but_tiny),
+        "large_stocks": tuple(large_stocks),
+    }
+    
+    return subset_permco
+
 
 
 # ==============================================================================================
