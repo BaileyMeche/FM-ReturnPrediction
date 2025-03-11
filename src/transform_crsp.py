@@ -104,7 +104,37 @@ def get_subsets(crsp):
     
     return subset_permco
 
-
+def calculate_rolling_beta(group, window=12):
+    """
+    Calculate rolling beta (market sensitivity) for a stock or portfolio.
+    
+    Parameters:
+    -----------
+    group : pandas.DataFrame
+        DataFrame containing 'mthret' (stock returns) and 'vwretd' (market returns)
+    window : int, default=12
+        Number of months to use in the rolling window calculation
+        
+    Returns:
+    --------
+    pandas.Series
+        Rolling beta values with the same index as the input DataFrame
+    """
+    # Check for required columns
+    if not all(col in group.columns for col in ['mthret', 'vwretd']):
+        raise ValueError("DataFrame must contain both 'mthret' and 'vwretd' columns")
+    
+    # Drop rows where either return is missing
+    aligned_returns = group[['mthret', 'vwretd']].dropna()
+    
+    # Calculate rolling beta
+    rolling_cov = aligned_returns['mthret'].rolling(window=window).cov(aligned_returns['vwretd'])
+    rolling_var = aligned_returns['vwretd'].rolling(window=window).var()
+    
+    # Handle division by zero or near-zero variance
+    rolling_beta = rolling_cov / rolling_var.replace(0, np.nan)
+    
+    return rolling_beta
 
 # ==============================================================================================
 # INDEX DATA
