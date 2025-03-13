@@ -26,6 +26,7 @@ https://wrds-www.wharton.upenn.edu/documents/400/CRSP_Programmers_Guide.pdf
 """
 from pathlib import Path
 from typing import Union, List
+from datetime import datetime
 
 import pandas as pd
 import wrds
@@ -48,7 +49,7 @@ from utils import (
 # Global Configuration
 # ==============================================================================================
 
-RAW_DATA_DIR = Path(config("RAW_DATA_DIR"))
+RAW_DATA_DIR = config("RAW_DATA_DIR")
 WRDS_USERNAME = config("WRDS_USERNAME")
 START_DATE = config("START_DATE")
 END_DATE = config("END_DATE")
@@ -79,7 +80,8 @@ description_compustat = {
     "epspfi": "Earnings Per Share (Basic) - Including Extraordinary Items",
     "epspx": "Earnings Per Share (Basic) - Excluding Extraordinary Items",
     "dvpd": "Cash Dividends Paid",
-    "dvt": "Cash Dividends Paid", 
+    "dvc": "Dividends Common/Ordinary (dvc)",
+    "dvt": "Dividends - Total (dvt)", 
     "csho": "Common Shares Outstanding",
     "cshpri": "Common Shares Used to Calculate Earnings Per Share - Basic", 
     "dltt": "Long-Term Debt - Total",
@@ -150,14 +152,15 @@ def pull_Compustat(
     """
     
     # Parse dates:
-    if start_date is not None:
+    if start_date is None:
+        start_date = "1959-01-01"
+    elif isinstance(start_date, (pd.Timestamp, datetime)):
         start_date = start_date.strftime("%Y-%m-%d")
-    else:
-        start_date = '1951-01-01'
-    if end_date is not None:
-        end_date = end_date.strftime("%Y-%m-%d")
-    else:
+
+    if end_date is None:
         end_date = pd.Timestamp.now().strftime("%Y-%m-%d")
+    elif isinstance(end_date, (pd.Timestamp, datetime)):
+        end_date = end_date.strftime("%Y-%m-%d")
 
     if vars_str is not None:
         vars_str = ", ".join(vars_str)
@@ -167,7 +170,8 @@ def pull_Compustat(
                     "act - che AS non_cash_current_assets,"
                     "lct,"
                     "dltt + dlc AS total_debt,"
-                    "dp AS depreciation")
+                    "dp AS depreciation, "
+                    "dvpd, dvc, dvt, pstk, pstkl, pstkrv, txditc, seq")
     
     # Convert filter_value to a tuple for SQL
     gvkey_tuple = _tickers_to_tuple(gvkey)
@@ -313,6 +317,7 @@ def pull_CRSP_Comp_link_table(
         WHERE 
             substr(linktype,1,1)='L'
             AND (linkprim ='C' OR linkprim='P')
+            AND linktype NOT IN ('LX', 'LD', 'LN')
     """
 
     if gvkey_tuple is not None:
@@ -332,19 +337,10 @@ def pull_CRSP_Comp_link_table(
 
 
 def _demo():
-    comp = load_cache_data(data_dir=RAW_DATA_DIR, file_name="Compustat.parquet")
+    comp = load_cache_data(data_dir=RAW_DATA_DIR, file_name="Compustat_fund.parquet")
     ccm = load_cache_data(data_dir=RAW_DATA_DIR, file_name="CRSP_Comp_Link_Table.parquet")
 
 
 if __name__ == "__main__":
-    comp = pull_Compustat(wrds_username=WRDS_USERNAME,
-                          start_date=START_DATE,
-                          end_date=END_DATE,
-                          file_name="Compustat.parquet",
-                          )
-
-    ccm = pull_CRSP_Comp_link_table(wrds_username=WRDS_USERNAME,
-                          start_date=START_DATE,
-                          end_date=END_DATE,
-                          file_name="CRSP_Comp_Link_Table.parquet"
-                          )
+    comp = pull_Compustat(wrds_username=WRDS_USERNAME, start_date=START_DATE, end_date=END_DATE, file_name="Compustat.parquet",)
+    ccm = pull_CRSP_Comp_link_table(wrds_username=WRDS_USERNAME, start_date=START_DATE, end_date=END_DATE, file_name="CRSP_Comp_Link_Table.parquet")
