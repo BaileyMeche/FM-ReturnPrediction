@@ -327,3 +327,142 @@ def load_cache_data(data_dir=RAW_DATA_DIR, file_name=None):
         return _read_cached_data(cached_file_path)
     else:
         raise FileNotFoundError(f"File {file_name} not found in {data_dir}.")
+    
+
+# =============================================================================
+# Manipulating DataFrames Utilities
+# =============================================================================
+
+
+def time_series_to_df(returns: Union[pd.DataFrame, pd.Series, List[pd.Series]], name: str = "Returns"):
+    """
+    Converts returns to a DataFrame if it is a Series or a list of Series.
+
+    Parameters:
+        returns (pd.DataFrame, pd.Series or List or pd.Series): Time series of returns.
+
+    Returns:
+        pd.DataFrame: DataFrame of returns.
+    """
+    if isinstance(returns, pd.DataFrame):
+        returns = returns.copy()
+    if isinstance(returns, pd.Series):
+        returns = returns.to_frame()
+    elif isinstance(returns, list):
+        returns_list = returns.copy()
+        returns = pd.DataFrame({})
+
+        for series in returns_list:
+            if isinstance(series, pd.Series):
+                returns = returns.merge(series, right_index=True, left_index=True, how='outer')
+            else:
+                raise TypeError(f'{name} must be either a pd.DataFrame or a list of pd.Series')
+            
+    # Convert returns to float
+    try:
+        returns = returns.apply(lambda x: x.astype(float))
+    except ValueError:
+        print(f'Could not convert {name} to float. Check if there are any non-numeric values')
+        pass
+
+    return returns
+
+
+def fix_dates_index(returns: pd.DataFrame):
+    """
+    Fixes the date index of a DataFrame if it is not in datetime format and convert returns to float.
+
+    Parameters:
+        returns (pd.DataFrame): DataFrame of returns.
+
+    Returns:
+        pd.DataFrame: DataFrame with datetime index.
+    """
+    # Check if 'date' is in the columns and set it as the index
+
+    # Set index name to 'date' if appropriate
+    
+    if returns.index.name is not None:
+        if returns.index.name.lower() in ['date', 'dates', 'datetime']:
+            returns.index.name = 'date'
+    elif isinstance(returns.index[0], (datetime.date, datetime.datetime)):
+        returns.index.name = 'date'
+    elif 'date' in returns.columns.str.lower():
+        returns = returns.rename({'Date': 'date'}, axis=1)
+        returns = returns.set_index('date')
+    elif 'datetime' in returns.columns.str.lower():
+        returns = returns.rename({'Datetime': 'date'}, axis=1)
+        returns = returns.rename({'datetime': 'date'}, axis=1)
+        returns = returns.set_index('date')
+
+    # Convert dates to datetime if not already in datetime format or if minutes are 0
+    try:
+        returns.index = pd.to_datetime(returns.index, utc=True)
+        if (returns.index.minute == 0).all():
+            returns.index = returns.index.date
+    except ValueError:
+        print('Could not convert the index to datetime. Check the index format for invalid dates.')
+            
+    # Convert returns to float
+    try:
+        returns = returns.apply(lambda x: x.astype(float))
+    except ValueError:
+        print('Could not convert returns to float. Check if there are any non-numeric values')
+        pass
+
+    return returns
+
+
+def _filter_columns_and_indexes(
+    df: pd.DataFrame,
+    keep_columns: Union[list, str],
+    drop_columns: Union[list, str],
+    keep_indexes: Union[list, str],
+    drop_indexes: Union[list, str]
+):
+    """
+    Filters a DataFrame based on specified columns and indexes.
+
+    Parameters:
+        df (pd.DataFrame): DataFrame to be filtered.
+        keep_columns (list or str): Columns to keep in the DataFrame.
+        drop_columns (list or str): Columns to drop from the DataFrame.
+        keep_indexes (list or str): Indexes to keep in the DataFrame.
+        drop_indexes (list or str): Indexes to drop from the DataFrame.
+
+    Returns:
+        pd.DataFrame: The filtered DataFrame.
+    """
+
+    if not isinstance(df, (pd.DataFrame, pd.Series)):
+        return df
+    
+    df = df.copy()
+
+    # Columns
+    if keep_columns is not None:
+        keep_columns = [re.escape(col) for col in keep_columns]
+        keep_columns = "(?i).*(" + "|".join(keep_columns) + ").*" if isinstance(keep_columns, list) else "(?i).*" + keep_columns + ".*"
+        df = df.filter(regex=keep_columns)
+        if drop_columns is not None:
+            print('Both "keep_columns" and "drop_columns" were specified. "drop_columns" will be ignored.')
+
+    elif drop_columns is not None:
+        drop_columns = [re.escape(col) for col in drop_columns]
+        drop_columns = "(?i).*(" + "|".join(drop_columns) + ").*" if isinstance(drop_columns, list) else "(?i).*" + drop_columns + ".*"
+        df = df.drop(columns=df.filter(regex=drop_columns).columns)
+
+    # Indexes
+    if keep_indexes is not None:
+        keep_indexes = [re.escape(col) for col in keep_indexes]
+        keep_indexes = "(?i).*(" + "|".join(keep_indexes) + ").*" if isinstance(keep_indexes, list) else "(?i).*" + keep_indexes + ".*"
+        df = df.filter(regex=keep_indexes, axis=0)
+        if drop_indexes is not None:
+            print('Both "keep_indexes" and "drop_indexes" were specified. "drop_indexes" will be ignored.')
+
+    elif drop_indexes is not None:
+        drop_indexes = [re.escape(col) for col in drop_indexes]
+        drop_indexes = "(?i).*(" + "|".join(drop_indexes) + ").*" if isinstance(drop_indexes, list) else "(?i).*" + drop_indexes + ".*"
+        df = df.filter(regex=keep_indexes, axis=0)
+    
+    return df
