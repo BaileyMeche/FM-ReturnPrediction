@@ -41,8 +41,8 @@ from utils import (
     _flatten_dict_to_str,
     _tickers_to_tuple,
     _format_tuple_for_sql_list,
+    _save_cache_data,
     load_cache_data,
-    _save_cache_data
 )
 
 # ==============================================================================================
@@ -56,7 +56,7 @@ END_DATE = config("END_DATE")
 
  
 # ==============================================================================================
-# CRSP Data
+# STOCK DATA
 # ==============================================================================================
 """
 More information about the CRSP US Stock & Indexes Database can be found here:
@@ -251,21 +251,20 @@ def pull_CRSP_stock(
 
     return subset_CRSP_to_common_stock_and_exchanges(crsp)
 
+
 def subset_CRSP_to_common_stock_and_exchanges(crsp):
-    """Subset to common stock universe and
-    stocks traded on NYSE, AMEX and NASDAQ.
+    """Subset to common stock universe and stocks traded on NYSE, AMEX and NASDAQ.
 
     NOTE:
-        With the new CIZ format, it is not necessary to apply delisting
-        returns, as they are already applied.
+        With the new CIZ format, it is not necessary to apply delisting returns, as they are already applied.
     """
-    # In the old SIZ format, this would condition on shrcd = 10 or 11
+    # In the old SIZ format, this would condition on shrcd = 10 or 11.
+    # Now, this is classified under ShareType = ‘NS’
 
-    ## Select common stock universe
-    ##
-    # sharetype=='NS': Filters for securities where the 'Share Type' is
-    # "Not specified". This is confusing. See here:
-    # https://wrds-www.wharton.upenn.edu/pages/support/manuals-and-overviews/crsp/stocks-and-indices/crsp-stock-and-indexes-version-2/crsp-ciz-faq/#replicating-common-tasks
+    # Select common stock universe
+
+    # sharetype=='NS': Filters for securities where the 'Share Type' is "Not specified" (no special type). 
+    # See here: https://wrds-www.wharton.upenn.edu/pages/support/manuals-and-overviews/crsp/stocks-and-indices/crsp-stock-and-indexes-version-2/crsp-ciz-faq/#replicating-common-tasks
 
     # securitytype=='EQTY': Selects only securities classified as 'EQTY'
 
@@ -296,11 +295,129 @@ def subset_CRSP_to_common_stock_and_exchanges(crsp):
     return crsp
         
 
+
+# ==============================================================================================
+# INDEX DATA
+# ==============================================================================================
+
+
+def pull_CRSP_index(
+    wrds_username: str = WRDS_USERNAME,
+    start_date: pd.Timestamp = None,
+    end_date: pd.Timestamp = None,
+    freq: str = "D",
+    data_dir: Union[None, Path] = RAW_DATA_DIR,
+    file_name: str = None,
+    hash_file_name: bool = False,
+    file_type: str = None,
+) -> pd.DataFrame:
+    """
+    Pulls the monthly CRSP index files from crsp_a_indexes.msix or  crsp_a_indexes.dsix.
+    (Daily)NYSE/AMEX/NASDAQ Capitalization Deciles, Annual Rebalanced (dsix).
+    https://wrds-www.wharton.upenn.edu/data-dictionary/crsp_m_indexes/dsix/
+
+    (Monthly)NYSE/AMEX/NASDAQ Capitalization Deciles, Annual Rebalanced (msix).
+    https://wrds-www.wharton.upenn.edu/data-dictionary/crsp_m_indexes/msix/
+
+    This includes:
+        - decile returns: decret1, decret2,...,decret10
+        - equal-weighted returns (incl. and excl. dividends): ewretd, ewretx
+        - value-weighted returns (incl. and excl. dividends): vwretd, vwretx
+        - return on the S&P 500 index: sprtrn
+        - level of the S&P 500 index: spindx
+
+    Parameters
+    ----------
+    wrds_username : str
+        WRDS username.
+    start_date : str or pd.Timestamp, optional
+        Start date to pull data from. Default '1959-01-01' if None.
+    end_date : str or pd.Timestamp, optional
+        End date to pull data up to. Default is today's date if None.
+    data_dir : pathlib.Path or None, optional
+        Directory to cache.
+    file_name : str, optional
+        File name to store the cached data.
+    hash_file_name : bool, optional
+        If True, uses a hashed filename for cache. Otherwise uses a verbose name.
+    file_type : str, optional
+        File type for caching. Default 'parquet'.
+
+    Returns
+    -------
+    pd.DataFrame
+        CRSP Index data from msix.
+    """
+    # Handle date defaults
+    if start_date is None:
+        start_date = "1959-01-01"
+    elif isinstance(start_date, (pd.Timestamp, datetime)):
+        start_date = start_date.strftime("%Y-%m-%d")
+
+    if end_date is None:
+        end_date = pd.Timestamp.now().strftime("%Y-%m-%d")
+    elif isinstance(end_date, (pd.Timestamp, datetime)):
+        end_date = end_date.strftime("%Y-%m-%d")
+
+    if freq.upper() == "M":
+        table = "msix"
+    elif freq.upper() == "D":
+        table = "dsix"
+    else:
+        raise ValueError("freq must be either 'D' or 'M'")
+                         
+    # Prepare for caching
+    if file_name is None:
+        filters = {"start_date": start_date,
+                   "end_date": end_date,
+                   "freq": freq}
+        filter_str = _flatten_dict_to_str(filters)
+        if hash_file_name:
+            cache_paths = _hash_cache_filename(f"crsp_a_index_{table}", filter_str, data_dir)
+        else:
+            cache_paths = _cache_filename("crsp_a_index_{table}", filter_str, data_dir)
+        
+        # Check if file is cached
+        cached_fp = _file_cached(cache_paths)
+    else:
+        if not any(file_name.endswith(f".{ft}") for ft in ["parquet", "csv", "zip"]):
+            cache_paths= [data_dir / f"{file_name}.{ft}" for ft in ["parquet", "csv", "zip"]]
+            cached_fp = _file_cached(cache_paths)
+        else:
+            cache_paths = None
+            cached_fp = Path(data_dir, file_name) if Path(data_dir, file_name).exists() else None
+
+    if cached_fp:
+        print(f"Loading cached data from {cached_fp}")
+        return _read_cached_data(cached_fp)
+
+    # Build and run query
+    query = f"""
+        SELECT * 
+        FROM crsp_a_indexes.{table}
+        WHERE caldt BETWEEN '{start_date}' AND '{end_date}'
+    """
+    db = wrds.Connection(wrds_username=wrds_username)
+    df = db.raw_sql(query, date_cols=["caldt"])
+    db.close()
+
+    # Save to cache
+    cache_path = _save_cache_data(df, data_dir, cache_paths, file_name, file_type)
+    print(f"Saved data to {cache_path}")
+
+    return df
+
+
+
+
 def _demo():
     crsp_d = load_cache_data(data_dir=RAW_DATA_DIR, file_name="CRSP_stock_d.parquet")
     crsp_m = load_cache_data(data_dir=RAW_DATA_DIR, file_name="CRSP_stock_m.parquet")
+    crsp_index_d = load_cache_data(data_dir=RAW_DATA_DIR, file_name="CRSP_index_d.parquet")
 
 if __name__ == "__main__":
 
     crsp_d = pull_CRSP_stock(start_date=START_DATE, end_date=END_DATE, freq='D', wrds_username=WRDS_USERNAME, file_name="CRSP_stock_d.parquet")
     crsp_m = pull_CRSP_stock(start_date=START_DATE, end_date=END_DATE, freq='M', wrds_username=WRDS_USERNAME, file_name="CRSP_stock_m.parquet")
+    crsp_index_d = pull_CRSP_index(start_date=START_DATE, end_date=END_DATE, freq='D', wrds_username=WRDS_USERNAME, file_name="CRSP_index_d.parquet")
+    
