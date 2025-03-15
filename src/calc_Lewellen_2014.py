@@ -12,7 +12,7 @@ from typing import Union, List
 
 import numpy as np
 import pandas as pd
-import wrds
+import polars as pl
 from pandas.tseries.offsets import MonthEnd
 
 from settings import config
@@ -43,75 +43,75 @@ START_DATE = config("START_DATE")
 END_DATE = config("END_DATE")
 
 
-def get_subsets(crsp: pd.DataFrame):
+def get_subsets(crsp_comp: pd.DataFrame) -> dict:
     """
-    Return a dictionary 'subsets' with keys:
-        'all_but_tiny_stocks', 'large_stocks', 'all_stocks'
-    and each value is itself a dict whose keys are month-end dates
-    (e.g. crsp['mthcaldt']) and values are sets of permno.
+    Given a monthly CRSP DataFrame with columns at least:
+       ['mthcaldt', 'permno', 'me', 'primaryexch'],
+    compute the NYSE 20th and 50th percentile of 'me' each month, store them
+    in each row as 'me_20' and 'me_50', then build subset DataFrames:
 
-    subsets = {
-        'all_but_tiny_stocks': { month_end1: set_of_permnos, month_end2: ..., ... },
-        'large_stocks':        { month_end1: set_of_permnos, month_end2: ..., ... },
-        'all_stocks':          { month_end1: set_of_permnos, month_end2: ..., ... },
-    }
+      1) all_stocks          : everyone
+      2) all_but_tiny_stocks : rows where me >= me_20
+      3) large_stocks        : rows where me >= me_50
 
-    'all_but_tiny_stocks' are those larger than the NYSE 20th percentile
-    'large_stocks' are those larger than the NYSE 50th percentile
-    'all_stocks' is everyone.
-
-    Parameters
-    ----------
-    crsp : pd.DataFrame
-        Must contain at least 'mthcaldt', 'permno', 'me', and 'primaryexch'.
+    If a particular month has no NYSE stocks (so me_20 or me_50 is NaN),
+    then no rows from that month go into the 'all_but_tiny_stocks' or
+    'large_stocks' subsets.
 
     Returns
     -------
     dict
-        A dictionary of dictionaries, as described above.
+        {
+          "all_but_tiny_stocks":  <DataFrame of rows with me >= me_20>,
+          "large_stocks":         <DataFrame of rows with me >= me_50>,
+          "all_stocks":           crsp_comp   (the entire dataset)
+        }
     """
-    subsets = {
-        "all_but_tiny_stocks": {},
-        "large_stocks": {},
-        "all_stocks": {}
+    # 1) Sort for consistent grouping
+    crsp_comp = crsp_comp.sort_values(["mthcaldt", "permno"]).copy()
+
+    # 2) Compute month-specific me_20 and me_50 from NYSE
+    #    group by mthcaldt, restrict to primaryexch == 'N'
+    #    then get quantile(0.2) and quantile(0.5)
+    nyse_me_percentiles = (
+        crsp_comp
+        .loc[crsp_comp["primaryexch"] == "N"]      # keep only NYSE rows
+        .groupby("mthcaldt")["me"]
+        .quantile([0.2, 0.5])                      # get 20th & 50th
+        .unstack(level=1)                          # pivot so columns = [0.2, 0.5]
+        .reset_index()
+        .rename(columns={0.2: "me_20", 0.5: "me_50"})
+    )
+    # nyse_stats has columns ['mthcaldt', 'me_20', 'me_50']
+
+    # 3) Merge these percentile columns back to crsp_comp
+    crsp_comp = pd.merge(
+        crsp_comp,
+        nyse_me_percentiles,
+        on="mthcaldt",
+        how="left"
+    )
+
+    # 4) Create boolean columns for "all_but_tiny" and "large"
+    #    If me_20 or me_50 is NaN (month has no NYSE?), these will be False
+    crsp_comp["is_all_but_tiny"] = crsp_comp["me"] >= crsp_comp["me_20"]
+    crsp_comp["is_large"]        = crsp_comp["me"] >= crsp_comp["me_50"]
+
+    # 5) Now build the dictionary of DataFrames
+    all_stocks_df = crsp_comp.copy()
+
+    # For "all_but_tiny", we keep only rows with is_all_but_tiny == True
+    all_but_tiny_df = crsp_comp.loc[crsp_comp["is_all_but_tiny"] == True].copy()
+
+    # For "large_stocks", keep only rows with is_large == True
+    large_stocks_df = crsp_comp.loc[crsp_comp["is_large"] == True].copy()
+
+    subsets_crsp_comp = {
+        "all_stocks":          all_stocks_df,
+        "all_but_tiny_stocks": all_but_tiny_df,
+        "large_stocks":        large_stocks_df,
     }
-
-    # Group by the month-end date
-    for date, group_df in crsp.groupby("mthcaldt", as_index=False):
-        
-        # Identify the NYSE subset
-        nyse_df = group_df[group_df["primaryexch"] == "N"]
-        
-        # Compute the 20th and 50th percentile of 'me' in NYSE
-        if len(nyse_df) > 0:
-            me_20 = nyse_df["me"].quantile(0.2)
-            me_50 = nyse_df["me"].quantile(0.5)
-        else:
-            # If no NYSE stocks (rare or missing data), skip
-            me_20 = np.nan
-            me_50 = np.nan
-        
-        # 1. all_stocks = all permnos
-        all_stocks_set = set(group_df["permno"].unique())
-        subsets["all_stocks"][date] = all_stocks_set
-
-        # 2. all_but_tiny_stocks = me > me_20
-        if not np.isnan(me_20):
-            abt = group_df.loc[group_df["me"] > me_20, "permno"]
-            abt_set = set(abt.unique())
-        else:
-            abt_set = set()
-        subsets["all_but_tiny_stocks"][date] = abt_set
-
-        # 3. large_stocks = me > me_50
-        if not np.isnan(me_50):
-            large = group_df.loc[group_df["me"] > me_50, "permno"]
-            large_set = set(large.unique())
-        else:
-            large_set = set()
-        subsets["large_stocks"][date] = large_set
-
-    return subsets
+    return subsets_crsp_comp
 
 
 """
@@ -131,7 +131,7 @@ Calculate the fundamentals for each firm in the Compustat dataset.
     std_12: Monthly standard deviation, estimated from daily returns from month -12 to month -1
     debt_price: Short-term plus long-term debt divided by market value at the end of the prior month
     sales_price: Sales in the prior fiscal year divided by market value at the end of the prior month
-The return for each function is a DataFrame with month-ends as index and permno as columns.
+
 Accounting data are assumed to be known four months after the end of the fiscal year as calculated in add_report_date(comp) function.
 """ 
 
@@ -139,286 +139,213 @@ Accounting data are assumed to be known four months after the end of the fiscal 
 def calc_log_size(crsp_comp: pd.DataFrame) -> pd.DataFrame:
     """
     Calculate log market value of equity at the end of the prior month.
-
-    Returns
-    -------
-    pd.DataFrame
-        index = month-end date (mthcaldt)
-        columns = permno
-        values = ln( market_equity_{t-1} )
+    For each (permno, month), we take 'me' from the previous month and log it.
+    A new column 'log_size' is created.
     """
-    # Pivot to wide: row = mthcaldt, col = permno, val = me
-    me_pivot = crsp_comp.pivot_table(
-        index="mthcaldt", columns="permno", values="me"
-    )
-    # Shift by 1 row so that row t has prior month's ME
-    me_shifted = me_pivot.shift(1)
-    # log
-    log_size = np.log(me_shifted)
-    return log_size
+    # Shift 'me' by 1 month within each permno
+    crsp_comp["me_lag"] = crsp_comp.groupby("permno")["me"].shift(1)
+    crsp_comp["log_size"] = np.log(crsp_comp["me_lag"])
+    crsp_comp = crsp_comp.drop(columns=["me_lag"])
+
+    return crsp_comp
 
 def calc_log_bm(crsp_comp: pd.DataFrame) -> pd.DataFrame:
     """
-    Calculate log book-to-market ratio at the end of the prior month = ln(BE) - ln(ME).
-
-    Assumes crsp_comp has columns 'be' for book equity and 'me' for market equity,
-    both already forward-filled so that each permno–month row has the correct fundamental
-    valid for that month.
-
-    Returns
-    -------
-    pd.DataFrame
-        index = month-end date
-        columns = permno
-        values = ln(be_{t-1}) - ln(me_{t-1})
+    Calculate log book-to-market ratio = ln(BE_{t-1}) - ln(ME_{t-1}).
+    For each (permno, month), we shift 'be' and 'me' by 1 month, then take logs.
+    A new column 'log_bm' is created.
     """
-    me_pivot = crsp_comp.pivot_table(index="mthcaldt", columns="permno", values="me")
-    be_pivot = crsp_comp.pivot_table(index="mthcaldt", columns="permno", values="be")
+    crsp_comp["be_lag"] = crsp_comp.groupby("permno")["be"].shift(1)
+    crsp_comp["me_lag"] = crsp_comp.groupby("permno")["me"].shift(1)
 
-    me_shifted = me_pivot.shift(1)
-    be_shifted = be_pivot.shift(1)
+    crsp_comp["log_bm"] = np.log(crsp_comp["be_lag"]) - np.log(crsp_comp["me_lag"])
+    
+    crsp_comp = crsp_comp.drop(columns=["be_lag", "me_lag"])
 
-    log_bm = np.log(be_shifted) - np.log(me_shifted)
-    return log_bm
+    return crsp_comp
 
 
 def calc_return_12_2(crsp_comp: pd.DataFrame) -> pd.DataFrame:
     """
-    Calculate the cumulative return from month -12 to month -2.
-    In other words, for each month t, we skip the last month (t-1)
-    and compound returns from t-12 through t-2.
-
-    Returns
-    -------
-    pd.DataFrame
-        index = month-end date
-        columns = permno
-        values = cumulative return (not in logs) over months [t-12, t-2].
+    Calculate the cumulative return from month -12 to month -2 for each t.
+    We skip the last month (t-1) and compound returns from t-12 through t-2.
+    Creates a new column 'return_12_2'.
     """
-    # Pivot monthly returns
-    ret_pivot = crsp_comp.pivot_table(index="mthcaldt", columns="permno", values="retx")
-    
-    # We want the product of (1+ret) for 11 months: t-12..t-2
-    #  - shift(2) so that row t sees ret_{t-2} in the "current" row
-    #  - rolling(11) so we pick up t-2..t-12. That’s 11 monthly returns
-    ret_shifted = ret_pivot.shift(2)
+    # Shift returns by 2 so that row t sees ret_{t-2} in 'retx_shift2'
+    crsp_comp["retx_shift2"] = crsp_comp.groupby("permno")["retx"].shift(2)
 
-    def rolling_prod_minus_one(x):
-        return np.prod(1 + x) - 1
+    # We'll compute rolling product of 11 monthly returns: t-12..t-2
+    # For each permno, we do a rolling(11) on (1 + retx_shift2).
+    crsp_comp["1_plus_ret"] = 1 + crsp_comp["retx_shift2"]
 
-    # Rolling window of length=11
-    # For date t, this sums over t, t-1, ..., t-10 in the SHIFTED data,
-    # i.e. ret_{t-2}, ..., ret_{t-12} in original time
-    r_12_2 = ret_shifted.rolling(window=11, min_periods=11).apply(
-        rolling_prod_minus_one, raw=True
+    # Rolling product (min_periods=11 ensures we only compute when we have 11 data points)
+    crsp_comp["rollprod_11"] = (
+        crsp_comp
+        .groupby("permno")["1_plus_ret"]
+        .rolling(window=11, min_periods=11)
+        .apply(np.prod, raw=True)
+        .reset_index(level=0, drop=True)
     )
-    return r_12_2
+
+    crsp_comp["return_12_2"] = crsp_comp["rollprod_11"] - 1
+
+    crsp_comp.drop(["retx_shift2", "1_plus_ret", "rollprod_11"], axis=1, inplace=True)
+
+    return crsp_comp
 
 
 def calc_accruals(crsp_comp: pd.DataFrame) -> pd.DataFrame:
     """
-    Calculate change in non-cash net working capital minus depreciation in the prior fiscal year,
-    then expand to monthly frequency (index=month-end, columns=permno).
-
-    Assumes `crsp_comp` has columns:
-        - 'permno' (or else you must merge compustat with ccm first),
-        - 'report_date' = datadate + 4 months,
-        - 'accruals',
-        - 'depreciation'.
-
-    Returns
-    -------
-    pd.DataFrame
-        index = month-end
-        columns = permno
-        values = accrual measure
+    Calculate change in non-cash net working capital minus depreciation
+    in the prior fiscal year.
+    We assume the monthly row already contains the correct accruals and
+    depreciation for that month (e.g., forward-filled from annual data).
+    Creates a new column 'accruals_final'.
     """
-    df = crsp_comp.copy()
-
-    # Construct the annual measure
-    df["accruals_final"] = df["accruals"] - df["depreciation"]
-
-    # Expand forward from report_date to monthly, pivot
-    # (If your 'permno' is not in comp, you need the ccm link or a merged DataFrame.)
-    pivoted = expand_compustat_annual_to_monthly(
-        comp_annual=df,
-        date_col="report_date",
-        id_col="permno",
-        value_col="accruals_final"
-    )
-    return pivoted
+    crsp_comp["accruals_final"] = crsp_comp["accruals"] - crsp_comp["depreciation"]
+    return crsp_comp
 
 
 def calc_log_issues_36(crsp_comp: pd.DataFrame) -> pd.DataFrame:
     """
-    Calculate log growth in split-adjusted shares outstanding from month -36 to month -1.
-    For each month t, it is ln(shrout_{t-1}) - ln(shrout_{t-36}).
-
-    Returns
-    -------
-    pd.DataFrame
-        index = month-end
-        columns = permno
-        values = log( ... ) 
+    Calculate log growth in split-adjusted shares outstanding from t-36 to t-1:
+        ln(shrout_{t-1}) - ln(shrout_{t-36})
+    Creates a new column 'log_issues_36'.
     """
-    # Pivot shares outstanding
-    shrout_pivot = crsp_comp.pivot_table(index="mthcaldt", columns="permno", values="shrout")
+    crsp_comp["shrout_t1"] = crsp_comp.groupby("permno")["shrout"].shift(1)
+    crsp_comp["shrout_t36"] = crsp_comp.groupby("permno")["shrout"].shift(36)
 
-    # shrout_{t-1}
-    shrout_t1 = shrout_pivot.shift(1)
-    # shrout_{t-36}
-    shrout_t36 = shrout_pivot.shift(36)
-
-    log_issues_36 = np.log(shrout_t1) - np.log(shrout_t36)
-    return log_issues_36
-
-
-def calc_roa(comp: pd.DataFrame) -> pd.DataFrame:
-    """
-    Calculate ROA = (income before extraordinary items) / (average total assets) in prior FY,
-    then pivot to monthly frequency.
-
-    Here, as a placeholder, we assume comp['roa'] is already computed. If not,
-    you'd do something like:
-       comp['roa'] = comp['earnings'] / comp['assets']
-    with any needed lags or average of assets.
-
-    Returns
-    -------
-    pd.DataFrame
-        index = month-end
-        columns = permno
-        values = ROA
-    """
-    df = comp.copy()
-
-    df["roa"] = df["earnings"] / df["assets"]  # or average assets
-
-    pivoted = expand_compustat_annual_to_monthly(
-        comp_annual=df,
-        date_col="report_date",
-        id_col="permno",
-        value_col="roa"
+    crsp_comp["log_issues_36"] = (
+        np.log(crsp_comp["shrout_t1"]) - np.log(crsp_comp["shrout_t36"])
     )
-    return pivoted
+    crsp_comp.drop(["shrout_t1", "shrout_t36"], axis=1, inplace=True)
 
-
-def calc_log_assets_growth(comp: pd.DataFrame) -> pd.DataFrame:
-    """
-    Calculate log growth in total assets in the prior fiscal year,
-    then pivot to monthly frequency.
-
-    For each firm-year, log_assets_growth = ln(assets_t / assets_{t-1}).
-
-    Returns
-    -------
-    pd.DataFrame
-        index = month-end
-        columns = permno
-        values = log-asset-growth
-    """
-    df = comp.copy()
-    df = df.sort_values(["permno", "datadate"])
-
-    # We'll group by permno and compute one-year lag of 'assets'
-    df["lag_assets"] = df.groupby("permno")["assets"].shift(1)
-    df["log_assets_growth"] = np.log(df["assets"] / df["lag_assets"])
-
-    pivoted = expand_compustat_annual_to_monthly(
-        comp_annual=df,
-        date_col="report_date",
-        id_col="permno",
-        value_col="log_assets_growth"
-    )
-    return pivoted
-
-
-def calc_dy(crsp_comp: pd.DataFrame) -> pd.DataFrame:
-    """
-    Calculate dividend yield = (sum of div per share in prior 12 months) / price_{t-1}.
-    Using Dividends Common/Ordinary (dvc)
-    Returns
-    -------
-    pd.DataFrame
-        index = month-end
-        columns = permno
-        values = dividend yield
-    """
-    # Pivot dividends and price
-    div_pivot = crsp_comp.pivot_table(index="mthcaldt", columns="permno", values="dvc")
-    prc_pivot = crsp_comp.pivot_table(index="mthcaldt", columns="permno", values="prc")
-
-    # Rolling sum of dividends over last 12 months
-    div_12 = div_pivot.rolling(window=12, min_periods=1).sum()
-
-    # Price at t-1
-    prc_shifted = prc_pivot.shift(1)
-
-    dy = div_12 / prc_shifted
-    return dy
+    return crsp_comp
 
 
 def calc_log_issues_12(crsp_comp: pd.DataFrame) -> pd.DataFrame:
     """
-    Calculate log growth in shares outstanding from month -12 to month -1:
-    ln(shrout_{t-1}) - ln(shrout_{t-12}).
-
-    Returns
-    -------
-    pd.DataFrame
+    Calculate log growth in shares outstanding from t-12 to t-1:
+        ln(shrout_{t-1}) - ln(shrout_{t-12}).
+    Creates a new column 'log_issues_12'.
     """
-    shrout_pivot = crsp_comp.pivot_table(index="mthcaldt", columns="permno", values="shrout")
-    shrout_t1 = shrout_pivot.shift(1)
-    shrout_t12 = shrout_pivot.shift(12)
-    log_iss_12 = np.log(shrout_t1) - np.log(shrout_t12)
-    return log_iss_12
+    crsp_comp["shrout_t1"] = crsp_comp.groupby("permno")["shrout"].shift(1)
+    crsp_comp["shrout_t12"] = crsp_comp.groupby("permno")["shrout"].shift(12)
+
+    crsp_comp["log_issues_12"] = (
+        np.log(crsp_comp["shrout_t1"]) - np.log(crsp_comp["shrout_t12"])
+    )
+    crsp_comp.drop(["shrout_t1", "shrout_t12"], axis=1, inplace=True)
+
+    return crsp_comp
+
+
+def calc_roa(crsp_comp: pd.DataFrame) -> pd.DataFrame:
+    """
+    Calculate ROA as (income before extraordinary items) / (average total assets) in the prior FY.
+    We assume 'roa' or 'earnings' and 'assets' are already properly merged in each monthly row.
+    Creates a new column 'roa'.
+    """
+    # For illustration, if not already done:
+    crsp_comp["roa"] = crsp_comp["earnings"] / crsp_comp["assets"]  # or average if you have that
+    return crsp_comp
+
+
+def calc_log_assets_growth(crsp_comp: pd.DataFrame) -> pd.DataFrame:
+    """
+    Calculate log growth in total assets from prior year: ln(assets_t / assets_{t-1}).
+    We assume monthly data has the correct 'assets' for that month, forward-filled from the annual date.
+    Creates a new column 'log_assets_growth'.
+    """
+    crsp_comp["lag_assets"] = crsp_comp.groupby("permno")["assets"].shift(12)  # or shift(1) if truly each year is only 12 months apart
+
+    crsp_comp["log_assets_growth"] = np.log(crsp_comp["assets"] / crsp_comp["lag_assets"])
+    crsp_comp.drop("lag_assets", axis=1, inplace=True)
+    return crsp_comp
+
+
+def calc_dy(crsp_comp: pd.DataFrame) -> pd.DataFrame:
+    """
+    Calculate dividend yield = (sum of dividends over prior 12 months) / price_{t-1}.
+    We assume 'dvc' is the monthly dividend in month t, 'prc' is the end-of-month price.
+    Creates a new column 'dy'.
+    """
+    df = crsp_comp.sort_values(["permno", "mthcaldt"]).copy()
+
+    # Rolling sum of dividends over last 12 months
+    df["div12"] = (
+        df.groupby("permno")["dvc"]
+        .rolling(window=12, min_periods=1)
+        .sum()
+        .reset_index(level=0, drop=True)
+    )
+
+    # Price at t-1
+    df["prc_t1"] = df.groupby("permno")["prc"].shift(1)
+    df["dy"] = df["div12"] / df["prc_t1"]
+
+    df.drop(["div12", "prc_t1"], axis=1, inplace=True)
+
+    return df
 
 
 def calc_log_return_13_36(crsp_comp: pd.DataFrame) -> pd.DataFrame:
     """
-    Calculate the sum of log monthly returns over the window [t-36, t-13].
-
-    For each month t, we skip the last 12 months and sum the log returns from
-    t-36 up through t-13. The final output is a DataFrame whose row t
-    contains the sum of log(1 + ret_m) for months in [t-36, t-13].
-
-    Parameters
-    ----------
-    crsp_comp : pd.DataFrame
-        Must contain monthly returns for each (permno, date).
-        We assume:
-          - 'mthcaldt' is the month-end date,
-          - 'permno' is the security identifier,
-          - 'retx' is the monthly return (excluding dividends, if that is your convention).
-
-    Returns
-    -------
-    pd.DataFrame
-        index = month-end (sorted),
-        columns = permno,
-        values = sum of log(1 + ret) from t-36..t-13.
+    Calculate the sum of log monthly returns over [t-36, t-13].
+    For each month t, we skip last 12 months and sum the logs from t-36..t-13.
+    Creates a new column 'log_return_13_36'.
     """
 
-    # 1) Pivot to wide format:
-    #    row index = month-end date, column index = permno, values = monthly returns
-    monthly_ret = crsp_comp.pivot_table(index="mthcaldt", columns="permno", values="retx")
+    # log(1 + retx)
+    crsp_comp["log1p_ret"] = np.log(1 + crsp_comp["retx"])
 
-    # 2) Convert each monthly return to log(1 + r)
-    monthly_log_ret = np.log(1 + monthly_ret)
+    # shift by 13, then sum 24 rolling
+    crsp_comp["log1p_ret_shift13"] = crsp_comp.groupby("permno")["log1p_ret"].shift(13)
+    crsp_comp["log_sum_24"] = (
+        crsp_comp.groupby("permno")["log1p_ret_shift13"]
+        .rolling(window=24, min_periods=24)
+        .sum()
+        .reset_index(level=0, drop=True)
+    )
 
-    # 3) We want, for month t, the sum of log-returns from t-36 through t-13.
-    #    That is a 24-month window ending 13 months before t (exclusive of t-12..t-1).
-    #    - shift(13) pushes each row down by 13, so row t's log-return is ret_{t-13}.
-    #    - rolling(24).sum() aggregates from t-13 back to t-36 inclusive (24 rows).
-    shifted = monthly_log_ret.shift(13)
-    log_ret_13_36 = shifted.rolling(24).sum()
+    crsp_comp["log_return_13_36"] = crsp_comp["log_sum_24"]
 
-    return log_ret_13_36
+    crsp_comp.drop(["log1p_ret", "log1p_ret_shift13", "log_sum_24"], axis=1, inplace=True)
 
+    return crsp_comp
+
+
+def calc_debt_price(crsp_comp: pd.DataFrame) -> pd.DataFrame:
+    """
+    Calculate (short-term + long-term debt) / market equity at end of prior month.
+    Creates a new column 'debt_price'.
+    """
+    crsp_comp["me_lag"] = crsp_comp.groupby("permno")["me"].shift(1)
+
+    crsp_comp["debt_price"] = crsp_comp["total_debt"] / crsp_comp["me_lag"]
+
+    crsp_comp.drop("me_lag", axis=1, inplace=True)
+
+    return crsp_comp
+
+
+def calc_sales_price(crsp_comp: pd.DataFrame) -> pd.DataFrame:
+    """
+    Calculate (sales) / market value at the end of prior month.
+    Creates a new column 'sales_price'.
+    """
+    crsp_comp["me_lag"] = crsp_comp.groupby("permno")["me"].shift(1)
+
+    crsp_comp["sales_price"] = crsp_comp["sales"] / crsp_comp["me_lag"]
+
+    crsp_comp.drop("me_lag", axis=1, inplace=True)
+
+    return crsp_comp
 
 
 def calculate_rolling_beta(crsp_d: pd.DataFrame,
-                           crsp_index_d: pd.DataFrame) -> pd.DataFrame:
+                           crsp_index_d: pd.DataFrame,
+                           crsp_comp: pd.DataFrame) -> pd.DataFrame:
     """
     Calculate rolling beta from weekly returns for each stock, estimated
     over the past 36 months (~156 weeks).
@@ -429,6 +356,8 @@ def calculate_rolling_beta(crsp_d: pd.DataFrame,
         Must have 'dlycaldt' (daily date) and 'retx' (stock daily returns).
     crsp_index_d : pd.DataFrame
         Must have 'caldt' (daily date) and 'vwretx' (daily market returns).
+    crsp_comp : pd.DataFrame
+        Must have 'permno' (stock identifier) and 'mthcaldt' (month-end date).
     
     Returns
     -------
@@ -437,290 +366,233 @@ def calculate_rolling_beta(crsp_d: pd.DataFrame,
         columns = permno,
         values = rolling beta
     """
-    # 1) pivot daily stock returns
-    stocks_dret = crsp_d.pivot_table(index="dlycaldt", columns="permno", values="retx")
 
-    # 2) index daily market returns
-    market_dret = crsp_index_d.set_index("caldt")["vwretx"].sort_index()
+    df = crsp_d[['permno', 'dlycaldt', 'retx']].copy()
+    mkt = crsp_index_d[["caldt","vwretx"]].copy()
 
-    # 3) convert daily to weekly by e.g. resampling each Friday
-    stocks_wret = stocks_dret.resample("W-FRI").apply(lambda x: (1 + x).prod() - 1)
-    market_wret = market_dret.resample("W-FRI").apply(lambda x: (1 + x).prod() - 1)
+    # Rename columns
+    df = df.rename(columns={'retx': 'Ri', 'dlycaldt': 'date'})
+    mkt = mkt.rename(columns={'vwretx': 'Rm', 'caldt': 'date'})
 
-    # 4) rolling covariance and variance (156 weeks ~ 3 years)
-    window = 156
+    # Convert to Polars DataFrame
+    df_pl = pl.DataFrame(df)
+    mkt_pl = pl.DataFrame(mkt)
 
-    # Cov(i, m)
-    rolling_cov = stocks_wret.rolling(window).cov(market_wret)
-    # Var(m)
-    rolling_var_m = market_wret.rolling(window).var()
+    # Join on "date"
+    df_joined = df_pl.join(mkt_pl, on="date")
 
-    # Beta = cov(i,m) / var(m)
-    # rolling_cov is shaped like (date x permno) if it's a "panel" version.
-    # The easiest way is to align them carefully:
-    betas = rolling_cov.div(rolling_var_m, axis=0)
+    # Create log-returns (log_Ri, log_Rm) = log(1 + Ri), log(1 + Rm)
+    df_joined = df_joined.with_columns([
+        (pl.col("Ri") + 1).log().alias("log_Ri"),
+        (pl.col("Rm") + 1).log().alias("log_Rm")
+    ])
 
-    # This yields a DataFrame with the same shape as stocks_wret: index=week_ending, columns=permno.
-    # If you want to map it to each month-end, you might take the last weekly beta of each month:
-    betas_monthly = betas.resample("M").last()
+    # Convert to a LazyFrame to use groupby_rolling
+    lazy_df = df_joined.lazy()
 
-    return betas_monthly
+    # Use groupby_rolling to aggregate over a 156-week window, grouped by permno.
+    # This computes the rolling partial sums needed to approximate beta in log-return space.
+    df_beta_lazy = (
+        lazy_df
+        .group_by_dynamic(
+            index_column="date",
+            every="1w",
+            period="156w", 
+            by="permno"
+        )
+        .agg([
+            pl.col("log_Ri").sum().alias("sum_Ri"),
+            pl.col("log_Rm").sum().alias("sum_Rm"),
+            (pl.col("log_Ri") * pl.col("log_Rm")).sum().alias("sum_RiRm"),
+            (pl.col("log_Rm") ** 2).sum().alias("sum_Rm2"),
+            pl.count().alias("count_obs"),
+        ])
+        # Compute beta from the aggregated sums.
+        # Using the formula:
+        #   beta = [sum_RiRm - (sum_Ri * sum_Rm / N)] / [sum_Rm2 - (sum_Rm^2 / N)]
+        .with_columns([
+        (
+            (pl.col("sum_RiRm") - (pl.col("sum_Ri") * pl.col("sum_Rm") / pl.col("count_obs")))
+            /
+            (pl.col("sum_Rm2") - (pl.col("sum_Rm")**2 / pl.col("count_obs")))
+        ).alias("beta")
+        ])
+    )
 
+    # Collect the results into an eager DataFrame.
+    df_beta_pl = df_beta_lazy.collect()
 
+    # (Optional) Convert back to a pandas DataFrame if needed.
+    df_beta = df_beta_pl.to_pandas()
 
-def calc_std_12(crsp_d: pd.DataFrame) -> pd.DataFrame:
-    """
-    Calculate monthly standard deviation, estimated from daily returns
-    over the past ~12 months (252 trading days).
-
-    Returns
-    -------
-    pd.DataFrame
-        index = month-end
-        columns = permno
-        values = stdev of daily returns over last 252 days.
-    """
-    daily_ret = crsp_d.pivot_table(index="dlycaldt", columns="permno", values="retx")
-
-    # 252-day rolling stdev
-    rolling_std = daily_ret.rolling(window=252, min_periods=100).std()
-
-    # Then pick the last stdev in each calendar month
-    std_monthly = rolling_std.resample("M").last()
-
-    return std_monthly
-
-
-def calc_debt_price(crsp_comp: pd.DataFrame) -> pd.DataFrame:
-    """
-    Calculate (short-term + long-term debt) / market equity at end of prior month.
+    df_beta['jdate'] = pd.to_datetime(df_beta['date']).dt.to_period('M').dt.to_timestamp('M')
+    df_beta.drop_duplicates(subset=['permno', 'jdate'], keep='last', inplace=True)
     
-    Typically, 'debt' = dlc + dltt from Compustat, forward-filled to each permno–month,
-    and 'me' is the CRSP market equity.
+    crsp_comp =  pd.merge(left=crsp_comp, right=df_beta[['permno', 'jdate', 'beta']], on=['permno', 'jdate'], how='left')
 
-    Returns
-    -------
-    pd.DataFrame
-        index = month-end
-        columns = permno
-        values = debt_price ratio
+    return crsp_comp
+
+
+
+def calc_std_12(crsp_d: pd.DataFrame, crsp_comp: pd.DataFrame) -> pd.DataFrame:
     """
-    df = crsp_comp.copy()
-
-    # Pivot both
-    debt_pivot = df.pivot_table(index="mthcaldt", columns="permno", values="total_debt")
-    me_pivot   = df.pivot_table(index="mthcaldt", columns="permno", values="me")
-
-    # Shift the market equity by 1 to get "prior month"
-    me_shifted = me_pivot.shift(1)
+    Calculate monthly standard deviation from daily returns over the past ~12 months (252 trading days).
+    This is the only function that works on daily data. We then merge the monthly result back.
+    Creates a monthly DataFrame of stdevs, then you can merge to your monthly 'crsp_comp'.
+    """
     
-    debt_price = debt_pivot.div(me_shifted)
-    return debt_price
+    df_std_12 = crsp_d.copy()
+
+    # 252-day rolling std
+    df_std_12["rolling_std_252"] = (
+        df_std_12.groupby("permno")["retx"]
+        .rolling(window=252, min_periods=100)
+        .std()
+        .reset_index(level=0, drop=True)
+    )
+
+    # 3) For each month-end, pick the last available daily std in that month
+    #    We'll create 'month_end' for daily data, then do a groupby last.
+    df_std_12["jdate"] = df_std_12["dlycaldt"].dt.to_period("M").dt.to_timestamp("M")
+    df_std_12.drop_duplicates(subset=['permno', 'jdate'], keep='last', inplace=True)
+    
+    crsp_comp =  pd.merge(left=crsp_comp, right=df_std_12[['permno', 'jdate', 'rolling_std_252']], on=['permno', 'jdate'], how='left')
+
+    return crsp_comp
 
 
-def calc_sales_price(crsp_comp: pd.DataFrame) -> pd.DataFrame:
+def filter_companies_table1(crsp_comp: pd.DataFrame, needed_var: list = None) -> set:
     """
-    Calculate (sales in prior fiscal year) / market value at the end of prior month.
-    Expects the merged monthly DataFrame to have columns 'sales' and 'me'.
+    Identify companies that do NOT fit the criteria.
 
-    Returns
-    -------
-    pd.DataFrame
-        index = month-end
-        columns = permno
-        values = sales / me_{t-1}
-    """
-    df = crsp_comp.copy()
-
-    sales_pivot = df.pivot_table(index="mthcaldt", columns="permno", values="sales")
-    me_pivot    = df.pivot_table(index="mthcaldt", columns="permno", values="me")
-
-    me_shifted = me_pivot.shift(1)
-
-    sales_price = sales_pivot.div(me_shifted)
-    return sales_price
-
-
-
-def filter_companies_table1(all_variables_dict: dict) -> dict:
-    """
-    The function filters the companies that have:
+    A company fits the criteria if, for each required variable, it has at least one nonmissing value.
+    That is, if for any required variable a company has all missing values, it does NOT fit the criteria:
       - current-month returns (Return, %)
       - beginning-of-month size (Log Size (-1))
       - book-to-market (Log B/M (-1))
       - lagged 12-month returns (Return (-2, -12))
 
+    That is, it removes companyes with all missing values for any of these variables.
     Returns
     -------
-    dict
-        {mth_end_date: set_of_permnos_with_all_required_data}
+    set
+        A set of permnos for companies that have all missing values in any one of the required variables.
     """
-    # The variable names in the all_variables_dict might be:
-    #   'Return (%)'
-    #   'Log Size (-1)'
-    #   'Log B/M (-1)'
-    #   'Return (-2, -12)'
-    needed_vars = [
-        "Return (%)", 
-        "Log Size (-1)", 
-        "Log B/M (-1)", 
-        "Return (-2, -12)"
-    ]
+    if needed_var is None:
+        needed_vars = ["retx", "log_size", "log_bm", "return_12_2"]
+    else:
+        needed_vars = needed_var
 
-    # We do an intersection-based approach: for each month, find permnos
-    # that are non-missing in all the needed variables
-    filtered_companies_dict = {}
+    # For each company, check if there is any variable for which all values are missing.
+    def has_all_missing(group):
+        # group[needed_vars].isna().all() returns a boolean Series per column
+        # .any() returns True if any column is entirely missing.
+        return group[needed_vars].isna().all().any()
 
-    # We assume all DFs share roughly the same index of month-ends
-    # but let's get the union of all of them:
-    all_dates = set()
-    for var in needed_vars:
-        all_dates = all_dates.union(all_variables_dict[var].index)
+    # Group by company identifier and apply the check.
+    flag_series = crsp_comp.groupby("permno").apply(has_all_missing)
 
-    all_dates = sorted(all_dates)  # to iterate in chronological order if needed
+    # Companies flagged True have at least one required variable completely missing.
+    not_fitting = set(flag_series[flag_series].index)
 
-    for dt in all_dates:
-        # Start with permnos that appear in all data
-        # If dt not in the DataFrame, skip
-        # Then keep only those with non-missing data
-        valid_permnos = None
-        for var in needed_vars:
-            df = all_variables_dict[var]
-            if dt not in df.index:
-                # No data at this date
-                valid_permnos = set()
-                break
-            row_data = df.loc[dt]  # this is a Series indexed by permno
-            not_na_permnos = row_data[~row_data.isna()].index
-            # Intersect with running set
-            if valid_permnos is None:
-                valid_permnos = set(not_na_permnos)
-            else:
-                valid_permnos &= set(not_na_permnos)
-
-            if len(valid_permnos) == 0:
-                break
-
-        # store it
-        filtered_companies_dict[dt] = valid_permnos if valid_permnos else set()
-
-    return filtered_companies_dict
+    return not_fitting
 
 
-def winsorize(all_variables_dict: dict, lower_percentile=1, upper_percentile=99) -> dict:
+def winsorize(crsp_comp: pd.DataFrame,
+                   varlist: list,
+                   lower_percentile=1,
+                   upper_percentile=99) -> pd.DataFrame:
     """
-    Winsorize all characteristics in all_variables_dict at [1%, 99%], monthly.
-    Replaces values below the 1st percentile with that percentile,
-    and above the 99th percentile with that percentile.
+    Winsorize the columns in `varlist` at [lower_percentile%, upper_percentile%], 
+    cross-sectionally *by month* in the long DataFrame.
+    Modifies the columns in place.
+    """
+    df = crsp_comp.sort_values(["mthcaldt", "permno"]).copy()
+
+    for var in varlist:
+        # Group by month, compute percentiles for that month
+        def _winsorize_subgroup(subdf: pd.DataFrame):
+            vals = subdf[var].dropna()
+            if len(vals) < 5:
+                return subdf  # Not enough data to reliably compute percentiles
+            low_val = np.percentile(vals, lower_percentile)
+            high_val = np.percentile(vals, upper_percentile)
+            subdf[var] = subdf[var].clip(lower=low_val, upper=high_val)
+            return subdf
+
+        df = df.groupby("mthcaldt", group_keys=False).apply(_winsorize_subgroup)
+
+    return df
+
+    
+def build_table_1(subsets_crsp_comp: dict,
+                  variables_dict: dict) -> pd.DataFrame:
+    """
+    For each variable in `variables_dict`, compute monthly cross-sectional
+    (mean, std, count) and then time-series average those stats. We'll do it
+    for each subset in `subsets_crsp_comp`.
 
     Parameters
     ----------
-    all_variables_dict : dict
-        Each value is a DataFrame with shape (month-end x permno).
-    lower_percentile : float
-    upper_percentile : float
-
-    Returns
-    -------
-    dict
-        Same structure, but winsorized in place.
-    """
-    for var, df in all_variables_dict.items():
-        # We'll modify df in place
-        for dt in df.index:
-            row = df.loc[dt]  # row is a Series of shape [permno]
-            valid = row.dropna()
-            if len(valid) < 5:
-                # Not enough data to compute percentiles
-                continue
-
-            lower_val = np.percentile(valid, lower_percentile)
-            upper_val = np.percentile(valid, upper_percentile)
-
-            clipped = row.clip(lower_val, upper_val)
-            df.loc[dt] = clipped
-    return all_variables_dict
-
-
-def build_table_1(all_variables_dict: dict, subsets: dict) -> pd.DataFrame:
-    """
-    Build Table 1 as described: time-series averages of the monthly cross-sectional
-    mean, stdev, and sample size for each variable.  We do it for each of the three
-    subsets: all_stocks, all_but_tiny_stocks, large_stocks.
+    subsets_crsp_comp : dict
+        {
+          "all_stocks":          <DataFrame>,
+          "all_but_tiny_stocks": <DataFrame>,
+          "large_stocks":        <DataFrame>
+        }
+    variables_dict : dict
+        Example:
+        {
+          "Return (%)": "retx",
+          "Log Size (-1)": "log_size",
+          "Log B/M (-1)":  "log_bm",
+           ...
+        }
 
     Returns
     -------
     pd.DataFrame
-        A summary table with one row per variable, and columns that contain
-        [AllStocks_Avg, AllStocks_Std, AllStocks_N,
-         ABT_Avg, ABT_Std, ABT_N,
-         Large_Avg, Large_Std, Large_N]
+       One row per variable in `variables_dict`,
+       columns = [<subset>_Mean, <subset>_Std, <subset>_N] for each subset.
     """
-    # 1) filter to required data, then 2) winsorize
-    filtered_companies_dict = filter_companies_table1(all_variables_dict)
-    all_variables_dict = winsorize(all_variables_dict, lower_percentile=1, upper_percentile=99)
+    results = []
 
-    # We'll do a final DataFrame that has one row per variable
-    # and columns for the three subsets * 3 statistics
-    subset_names = ["all_stocks", "all_but_tiny_stocks", "large_stocks"]
-    stats_cols = []
-    for sn in subset_names:
-        stats_cols += [f"{sn}_Avg", f"{sn}_Std", f"{sn}_N"]
-    table_rows = []
+    for var_label, var_col in variables_dict.items():
+        row_stats = []
 
-    for var_name, var_df in all_variables_dict.items():
-        # We'll collect 9 summary stats for this variable
-        row_dict = {"Variable": var_name}
+        # For each subset DataFrame in subsets_crsp_comp
+        for subset_name, df_subset in subsets_crsp_comp.items():
+            # 1) Filter out nulls
+            df_var = df_subset.dropna(subset=[var_col])
+            if df_var.empty:
+                # If none, fill with NaN
+                row_stats.extend([np.nan, np.nan, np.nan])
+                continue
 
-        for sn in subset_names:
-            # We gather cross-sectional stats month by month, then average across time
-            monthly_means = []
-            monthly_stds = []
-            monthly_counts = []
+            # 2) Group by month, compute cross-sectional stats
+            monthly_stats = df_var.groupby("mthcaldt")[var_col].agg(["mean", "std", "count"])
 
-            # subset[sn] is a dict: {month_end: set_of_permnos}
-            # filtered_companies_dict[dt] is the set that passes the "has data" filter
-            # We want the intersection
-            for dt in var_df.index:
-                if dt not in subsets[sn]:
-                    continue
-                if dt not in filtered_companies_dict:
-                    continue
+            # 3) Time-series average across months
+            avg_mean = monthly_stats["mean"].mean()
+            avg_std  = monthly_stats["std"].mean()
+            avg_n    = monthly_stats["count"].mean()
 
-                final_permnos = subsets[sn][dt].intersection(filtered_companies_dict[dt])
-                if len(final_permnos) == 0:
-                    continue
+            row_stats.extend([avg_mean, avg_std, avg_n])
 
-                data_slice = var_df.loc[dt, final_permnos].dropna()
-                if len(data_slice) == 0:
-                    continue
+        # We'll store a tuple of: (var_label, subset1 stats, subset2 stats, ...)
+        results.append((var_label, *row_stats))
 
-                monthly_means.append(data_slice.mean())
-                monthly_stds.append(data_slice.std())
-                monthly_counts.append(data_slice.shape[0])
+    # Build columns
+    columns = ["Variable"]
+    for subset_name in subsets_crsp_comp.keys():
+        columns += [
+            f"{subset_name}_Mean",
+            f"{subset_name}_Std",
+            f"{subset_name}_N"
+        ]
 
-            if len(monthly_means) > 0:
-                # Time-series average of cross-sectional means
-                mean_of_means = np.mean(monthly_means)
-                mean_of_stds  = np.mean(monthly_stds)
-                mean_of_counts= np.mean(monthly_counts)
-            else:
-                mean_of_means = np.nan
-                mean_of_stds  = np.nan
-                mean_of_counts= np.nan
-
-            row_dict[f"{sn}_Avg"] = mean_of_means
-            row_dict[f"{sn}_Std"] = mean_of_stds
-            row_dict[f"{sn}_N"]   = mean_of_counts
-
-        table_rows.append(row_dict)
-
-    # Build the final DataFrame
-    df_final = pd.DataFrame(table_rows)
-    df_final = df_final[["Variable"] + stats_cols]
-    return df_final
-
-
+    summary_df = pd.DataFrame(results, columns=columns)
+    return summary_df
 
 
 if __name__ == "__main__":
@@ -738,52 +610,56 @@ if __name__ == "__main__":
     # 2) Add report date and calculate book equity
     comp = add_report_date(comp)
     comp = calc_book_equity(comp)
+    comp = expand_compustat_annual_to_monthly(comp)
 
     # 3) Merge comp + crsp_m + ccm => crsp_comp
     crsp_comp = merge_CRSP_and_Compustat(crsp, comp, ccm)
 
-    # 4) Subsets
-    subsets = get_subsets(crsp)
-
-    # 5) Calculate all variables
-    returns = crsp.pivot_table(index='mthcaldt', columns='permno', values='retx')
+    # 4) Calculate all variables
+    crsp_comp = crsp_comp.sort_values(["permno", "mthcaldt"])
+    crsp_d = crsp_d.sort_values(["permno", "dlycaldt"])
+    crsp_index_d = crsp_index_d.sort_values(["caldt"])
     
-    log_size          = calc_log_size(crsp_comp)
-    log_bm            = calc_log_bm(crsp_comp)
-    return_2_12       = calc_return_12_2(crsp_comp)
-    accruals          = calc_accruals(crsp_comp)  # or calc_accruals(crsp_comp) if you have them merged
-    roa               = calc_roa(crsp_comp)
-    log_assets_growth = calc_log_assets_growth(crsp_comp)
-    dy                = calc_dy(crsp_comp)
-    log_return_13_36  = calc_log_return_13_36(crsp_comp)
-    log_issues_12     = calc_log_issues_12(crsp_comp)
-    log_issues_36     = calc_log_issues_36(crsp_comp)
-    betas             = calculate_rolling_beta(crsp_d, crsp_index_d)
-    std_12            = calc_std_12(crsp_d)
-    debt_price        = calc_debt_price(crsp_comp)
-    sales_price       = calc_sales_price(crsp_comp)
+    crsp_comp = calc_log_size(crsp_comp)
+    crsp_comp = calc_log_bm(crsp_comp)
+    crsp_comp = calc_return_12_2(crsp_comp)
+    crsp_comp = calc_accruals(crsp_comp)  # or calc_accruals(crsp_comp) if you have them merged
+    crsp_comp       = calc_roa(crsp_comp)
+    crsp_comp = calc_log_assets_growth(crsp_comp)
+    crsp_comp = calc_dy(crsp_comp)
+    crsp_comp = calc_log_return_13_36(crsp_comp)
+    crsp_comp = calc_log_issues_12(crsp_comp)
+    crsp_comp = calc_log_issues_36(crsp_comp)
+    crsp_comp = calc_debt_price(crsp_comp)
+    crsp_comp = calc_sales_price(crsp_comp)
+    crsp_comp = calc_std_12(crsp_d, crsp_comp)
+    crsp_comp = calculate_rolling_beta(crsp_d, crsp_index_d, crsp_comp)
 
-    # 6) Build the dictionary for Table 1
-    all_variables_dict = {
-        "Return (%)":                returns,                # or your return_2_12 if you literally want that
-        "Log Size (-1)":            log_size,
-        "Log B/M (-1)":             log_bm,
-        "Return (-2, -12)":         return_2_12,
-        "Log Issues (-1,-12)":      log_issues_12,
-        "Accruals (-1)":            accruals,
-        "ROA (-1)":                 roa,
-        "Log Assets Growth (-1)":   log_assets_growth,
-        "Dividend Yield (-1,-12)":  dy,
-        "Log Return (-13,-36)":     log_return_13_36,
-        "Log Issues (-1,-36)":      log_issues_36,
-        "Beta (-1,-36)":            betas,
-        "Std Dev (-1,-12)":         std_12,
-        "Debt/Price (-1)":          debt_price,
-        "Sales/Price (-1)":         sales_price,
+    # 5) Winsorize the variables to remove outliers
+    variables_dict = {
+    "Return (%)":                "retx",                # Assuming you are keeping this column name
+    "Log Size (-1)":             "log_size",
+    "Log B/M (-1)":              "log_bm",
+    "Return (-2, -12)":          "return_12_2",
+    "Log Issues (-1,-12)":       "log_issues_12",
+    "Accruals (-1)":             "accruals_final",
+    "ROA (-1)":                  "roa",
+    "Log Assets Growth (-1)":    "log_assets_growth",
+    "Dividend Yield (-1,-12)":   "dy",
+    "Log Return (-13,-36)":      "log_return_13_36",
+    "Log Issues (-1,-36)":       "log_issues_36",
+    "Beta (-1,-36)":             "rolling_beta",
+    "Std Dev (-1,-12)":          "rolling_std_252",
+    "Debt/Price (-1)":           "debt_price",
+    "Sales/Price (-1)":          "sales_price",
     }
+    crsp_comp = winsorize(crsp_comp, variables_dict.values())
+
+    # 6) Create subsets for analysis
+    subsets_comp_crsp = get_subsets(crsp_comp) # Dictionary of dataframes corresponding of the data sets
 
     # 7) Build Table 1
-    table_1 = build_table_1(all_variables_dict, subsets)
+    table_1 = build_table_1(subsets_comp_crsp, variables_dict)
 
 
     models = {
