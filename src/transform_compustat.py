@@ -38,55 +38,6 @@ import pandas as pd
 import numpy as np
 from pandas.tseries.offsets import MonthEnd, YearEnd
 
-def expand_compustat_annual_to_monthly(
-    comp_annual: pd.DataFrame, 
-    date_col: str = "report_date", 
-    id_col: str = "permno", 
-    value_col: str = "x"
-) -> pd.DataFrame:
-    """
-    Expand an annual fundamental item to a monthly timeseries, forward-filling
-    from each 'report_date' until the next.  Then pivot so that the rows
-    are month-end, columns are permno, and entries are the fundamental.
-
-    Expects comp_annual to have (at least):
-       [permno, report_date, x]
-    where 'x' is the fundamental measure you want to expand.
-
-    Returns
-    -------
-    pd.DataFrame
-        index = month-end (last calendar day of each month),
-        columns = permno,
-        values = last known fundamental.
-    """
-    df = comp_annual[[id_col, date_col, value_col]].dropna(subset=[date_col])
-    # Sort
-    df = df.sort_values([id_col, date_col]).reset_index(drop=True)
-
-    out_list = []
-    for perm, grp in df.groupby(id_col):
-        # set index = report_date
-        g = grp.set_index(date_col).sort_index()
-
-        # monthly freq (last day of each month).
-        # If you want EXACT month-ends from your CRSP data, you can
-        # do something like .asfreq('M') or .resample('M'), but
-        # keep in mind that resample('M') typically picks the last calendar day.
-        g_monthly = g.resample("M").ffill()  
-        # Tag this permno
-        g_monthly[id_col] = perm
-        out_list.append(g_monthly)
-
-    df_monthly = pd.concat(out_list).reset_index()
-    
-    # pivot
-    pivoted = df_monthly.pivot_table(
-        index=date_col, columns=id_col, values=value_col
-    )
-    pivoted.index.name = None  # rename if desired
-    return pivoted
-
 
 def add_report_date(comp):
     """
@@ -102,53 +53,6 @@ def add_report_date(comp):
     comp["report_date"] = comp["datadate"] + pd.DateOffset(months=4)
     
     return comp
-
-
-def merge_CRSP_and_Compustat(crsp, comp, ccm):
-    """
-    Merge CRSP and Compustat data to compute the book-to-market ratio (beme).
-
-    This function merges Compustat fundamentals with the CRSP data using
-    the CRSP-Compustat linking table (ccm). It first cleans the linking table by
-    setting missing linkenddt values to today's date, then merges on the company
-    identifier (gvkey). The function computes the end-of-year and portfolio
-    formation date (jdate) by offsetting the Compustat data date, and restricts
-    the links to those where the formation date falls between the link start
-    (linkdt) and end (linkenddt) dates. Finally, it merges the restricted
-    linking data with the CRSP dataset on permno and jdate, and calculates
-    the book-to-market ratio (beme) as the scaled book equity divided by
-    December market equity.
-
-    Parameters
-    ----------
-    crsp (pandas.DataFrame): 
-        CRSP data
-    comp (pandas.DataFrame):
-        Compustat fundamentals data with columns for "gvkey", "datadate", "be" 
-        (book equity), and "count" (number of years in Compustat).
-    ccm (pandas.DataFrame): 
-        CRSP-Compustat linking table containing "gvkey", "permno", "linkdt", 
-        and "linkenddt" used to match records across datasets.
-
-    Returns
-    ----------
-        - crsp_comp_merged (pandas.DataFrame): A merged DataFrame
-
-    """
-    # if linkenddt is missing then set to today date
-    ccm["linkenddt"] = ccm["linkenddt"].fillna(pd.to_datetime("today"))
-
-    ccm1 = pd.merge(comp, ccm, how="left", on=["gvkey"])
-    ccm1["yearend"] = ccm1["datadate"] + YearEnd(0)
-    ccm1["jdate"] = ccm1["yearend"] + MonthEnd(6)
-    # set link date bounds
-    ccm2 = ccm1[(ccm1["jdate"] >= ccm1["linkdt"]) & (ccm1["jdate"] <= ccm1["linkenddt"])]
-    comp_col = pd.unique(["gvkey", "permno", "datadate", "yearend", "jdate"] + list(comp.columns))
-    ccm2 = ccm2[comp_col]
-
-    # link comp and crsp
-    crsp_comp_merged = pd.merge(crsp, ccm2, how="inner", on=["permno", "jdate"])
-    return crsp_comp_merged
 
 
 def calc_book_equity(comp):
@@ -189,5 +93,134 @@ def calc_book_equity(comp):
 
     # Drop NaN values in 'be' (book equity) to ensure that only valid entries are considered.
     comp = comp.dropna(subset=['be'])
+    comp = comp.drop(columns=['ps', 'pstk', 'pstkrv', 'pstkl'], errors='ignore')  # Clean up by removing intermediate columns
     
     return comp
+
+
+def expand_compustat_annual_to_monthly(
+    comp_annual: pd.DataFrame,
+    id_col: str = "gvkey",
+    report_date_col: str = "report_date"
+) -> pd.DataFrame:
+    """
+    Transforms an annual Compustat dataset to monthly frequency by:
+      1. Dropping 'fyear'.
+      2. Creating 'fund_date' = 'report_date'.
+      3. For each gvkey, expanding to cover all month-ends from earliest to latest 'report_date'.
+      4. Forward-filling all fundamental data.
+
+    Parameters
+    ----------
+    comp_annual : pd.DataFrame
+        Annual Compustat data in "long" format, with columns such as:
+          - 'gvkey' (firm identifier)
+          - 'datadate' (yearly period end)
+          - 'report_date' (4 months after datadate, at month-end)
+          - 'fyear' (fiscal year) which we will drop
+          - Other columns with fundamental data (e.g. sales, ni, at, etc.).
+    id_col : str, default "gvkey"
+        The column name identifying the firm.
+    report_date_col : str, default "report_date"
+        The column name for the monthly period end that is 4 months after datadate.
+
+    Returns
+    -------
+    pd.DataFrame
+        A monthly DataFrame, with columns:
+          - <id_col> (e.g., gvkey)
+          - fund_date  (the expanded monthly date index)
+          - datadate, plus any original Compustat columns (other than fyear)
+          - Values are forward-filled from the annual data until the next report_date.
+    """
+
+    # 1. Drop fyear (ignore errors in case it's already missing)
+    df = comp_annual.drop(columns=["fyear"], errors="ignore").copy()
+
+    # 2. Create new column 'fund_date' (equal to report_date)
+    df["fund_date"] = df[report_date_col]
+
+    # 3. Sort and set a MultiIndex [gvkey, fund_date]
+    df.set_index([id_col, "fund_date"], inplace=True)
+    df.sort_index(inplace=True)
+
+    # 4. For each gvkey, reindex so that we have a row for every month-end date
+    #    from the earliest to the latest fund_date, forward-filling values.
+    max_date_all = pd.to_datetime(df.index.get_level_values("fund_date")).max()
+    def reindex_monthly(group: pd.DataFrame) -> pd.DataFrame:
+        # Extract the fund_date level as datetime from the MultiIndex.
+        dates = pd.to_datetime(group.index.get_level_values("fund_date"))
+        min_date = dates.min()
+        max_date = dates.max()
+        # Extend the maximum date by 12 months.
+        extended_max_date = min(max_date_all, max_date + pd.DateOffset(months=12))
+        # Build a range of month-end dates.
+        monthly_index = pd.date_range(start=min_date, end=extended_max_date, freq="M")
+        
+        # Retrieve the firm identifier from the first level of the index.
+        gvkey_val = group.index.get_level_values(0)[0]
+        # Create a new MultiIndex combining the firm id and the monthly dates.
+        new_index = pd.MultiIndex.from_product(
+            [[gvkey_val], monthly_index],
+            names=[group.index.names[0], "fund_date"]
+        )
+        
+        # Reindex the group using the new MultiIndex and forward-fill.
+        return group.reindex(new_index, method="ffill")
+
+    # Apply reindexing group-by-group
+    expanded = (
+        df.groupby(level=id_col, group_keys=False)
+          .apply(reindex_monthly)
+    )
+
+    # Rename the second index level to 'fund_date'
+    expanded = expanded.rename_axis([id_col, "fund_date"])
+    expanded = expanded.reset_index()
+
+    return expanded
+
+
+def merge_CRSP_and_Compustat(crsp, comp, ccm):
+    """
+    Merge CRSP and Compustat data to compute the book-to-market ratio (beme).
+
+    This function merges Compustat fundamentals with the CRSP data using
+    the CRSP-Compustat linking table (ccm). It first cleans the linking table by
+    setting missing linkenddt values to today's date, then merges on the company
+    identifier (gvkey). The function computes the end-of-year and portfolio
+    formation date (jdate) by offsetting the Compustat data date, and restricts
+    the links to those where the formation date falls between the link start
+    (linkdt) and end (linkenddt) dates. Finally, it merges the restricted
+    linking data with the CRSP dataset on permno and jdate, and calculates
+    the book-to-market ratio (beme) as the scaled book equity divided by
+    December market equity.
+
+    Parameters
+    ----------
+    crsp (pandas.DataFrame): 
+        CRSP data
+    comp (pandas.DataFrame):
+        Compustat fundamentals data with columns for "gvkey", "fund_date", "be" 
+        (book equity), and "count" (number of years in Compustat).
+    ccm (pandas.DataFrame): 
+        CRSP-Compustat linking table containing "gvkey", "permno", "linkdt", 
+        and "linkenddt" used to match records across datasets.
+
+    Returns
+    ----------
+        - crsp_comp_merged (pandas.DataFrame): A merged DataFrame
+
+    """
+    # if linkenddt is missing then set to today date
+    ccm["linkenddt"] = ccm["linkenddt"].fillna(pd.to_datetime("today"))
+    comp = comp.rename(columns={"fund_date": "jdate"})
+    ccm1 = pd.merge(comp, ccm, how="left", on=["gvkey"])
+    # set link date bounds
+    ccm2 = ccm1[(ccm1["jdate"] >= ccm1["linkdt"]) & (ccm1["jdate"] <= ccm1["linkenddt"])]
+    comp_col = ["permno"] + list(comp.columns)
+    ccm2 = ccm2[comp_col]
+
+    # link comp and crsp
+    crsp_comp_merged = pd.merge(crsp, ccm2, how="inner", on=["permno", "jdate"])
+    return crsp_comp_merged

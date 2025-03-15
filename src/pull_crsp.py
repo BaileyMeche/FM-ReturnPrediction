@@ -242,7 +242,7 @@ def pull_CRSP_stock(
     # Clean up
     crsp[["permno", "permco"]] = crsp[["permno", "permco"]].astype(int, errors="ignore")
 
-    # For convenience, align to end-of-month
+    # For convenience, align to end-of-month as a "join date" to link with Compustat
     crsp["jdate"] = crsp[date_col] + MonthEnd(0)
 
     # Save to cache
