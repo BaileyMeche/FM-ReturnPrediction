@@ -73,7 +73,6 @@ DATA_DIR = Path(config("DATA_DIR"))
 RAW_DATA_DIR = Path(config("RAW_DATA_DIR"))
 MANUAL_DATA_DIR = Path(config("MANUAL_DATA_DIR"))
 OUTPUT_DIR = Path(config("OUTPUT_DIR"))
-PUBLISH_DIR = Path(config("PUBLISH_DIR"))
 USER = config("USER") 
 OS_TYPE = config("OS_TYPE")
 
@@ -124,9 +123,18 @@ def task_config():
 
 
 
-notebook_tasks = {
-    
-}
+# notebook_tasks = {
+#     "get_data.ipynb"
+# }
+from pathlib import Path
+
+# Automatically discover all notebooks in the ./src directory.
+notebook_tasks = {}
+for nb_path in Path("./src").glob("*.ipynb"):
+    notebook_tasks[nb_path.name] = {
+        "file_dep": [nb_path],
+        "targets": [Path("./output") / f"_{nb_path.stem}.py"]
+    }
 
 
 def task_convert_notebooks_to_scripts():
