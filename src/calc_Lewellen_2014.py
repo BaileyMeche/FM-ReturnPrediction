@@ -743,7 +743,7 @@ def create_figure_1(subsets_comp_crsp: dict,
     slopes_dict = {}
 
     # Loop over the two subsets: "all_stocks" and "large_stocks"
-    for subset_name in ["All Stocks", "Large stocks"]:
+    for subset_name in ["All stocks", "Large stocks"]:
         if subset_name not in subsets_comp_crsp:
             continue
 
@@ -779,8 +779,8 @@ def create_figure_1(subsets_comp_crsp: dict,
     ax_a, ax_b = axes
 
     # Panel A: All Stocks
-    if "All Stocks" in slopes_dict:
-        df_a = slopes_dict["All Stocks"]
+    if "All stocks" in slopes_dict:
+        df_a = slopes_dict["All stocks"]
         for var in model2_vars:
             ax_a.plot(df_a.index, df_a[var], label=var_labels.get(var, var))
         ax_a.set_title("Panel A: All Stocks (10-Year Rolling Slopes)")
