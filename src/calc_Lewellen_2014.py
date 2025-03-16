@@ -671,49 +671,49 @@ def build_table_1(subsets_crsp_comp: dict,
 
 
 
-def build_table_2(subsets_crsp_comp: dict, factors_dict: dict):
+# def build_table_2(subsets_crsp_comp: dict, factors_dict: dict):
 
-    models_predictors = {
-    'Model 1: Three Predictors': ['Log Size (-1)', 'Log B/M (-1)', 'Return (-2, -12)'],
-    'Model 2: Seven Predictors': [
-                        'Log Size (-1)', 'Log B/M (-1)', 'Return (-2, -12)', 'Log Issues (-1,-36)', 
-                        'Accruals (-1)', 'ROA (-1)', 'Log Assets Growth (-1)'
-                        ],
-    'Model 3: Fourteen Predictors': [
-                        'Log Size (-1)', 'Log B/M (-1)', 'Return (-2, -12)', 
-                        'Log Issues (-1,-12)', 'Accruals (-1)', 'ROA (-1)', 'Log Assets Growth (-1)', 
-                        'Dividend Yield (-1,-12)', 'Log Return (-13,-36)', 'Log Issues (-1,-36)', 
-                        'Beta (-1,-36)', 'Std Dev (-1,-12)', 'Debt/Price (-1)', 'Sales/Price (-1)'
-                        ]
-    }
+#     models_predictors = {
+#     'Model 1: Three Predictors': ['Log Size (-1)', 'Log B/M (-1)', 'Return (-2, -12)'],
+#     'Model 2: Seven Predictors': [
+#                         'Log Size (-1)', 'Log B/M (-1)', 'Return (-2, -12)', 'Log Issues (-1,-36)', 
+#                         'Accruals (-1)', 'ROA (-1)', 'Log Assets Growth (-1)'
+#                         ],
+#     'Model 3: Fourteen Predictors': [
+#                         'Log Size (-1)', 'Log B/M (-1)', 'Return (-2, -12)', 
+#                         'Log Issues (-1,-12)', 'Accruals (-1)', 'ROA (-1)', 'Log Assets Growth (-1)', 
+#                         'Dividend Yield (-1,-12)', 'Log Return (-13,-36)', 'Log Issues (-1,-36)', 
+#                         'Beta (-1,-36)', 'Std Dev (-1,-12)', 'Debt/Price (-1)', 'Sales/Price (-1)'
+#                         ]
+#     }
         
-    all_results = []
+#     all_results = []
 
-    for subset_name, df in subsets_crsp_comp.items():
-        for model_name, xvars_names in models_predictors.items():
-            xvars = [factors_dict[xvar_name] for xvar_name in xvars_names]
-            # 1) cross-sectional regressions by month
-            monthly_cs = run_monthly_cs_regressions(
-                df=df,
-                return_col="retx",      # or whatever your return column is 
-                predictor_cols=xvars,
-                date_col="mthcaldt"
-            )
+#     for subset_name, df in subsets_crsp_comp.items():
+#         for model_name, xvars_names in models_predictors.items():
+#             xvars = [factors_dict[xvar_name] for xvar_name in xvars_names]
+#             # 1) cross-sectional regressions by month
+#             monthly_cs = run_monthly_cs_regressions(
+#                 df=df,
+#                 return_col="retx",      # or whatever your return column is 
+#                 predictor_cols=xvars,
+#                 date_col="mthcaldt"
+#             )
 
-            # 2) Fama-MacBeth summary
-            fm_summary = fama_macbeth_summary(monthly_cs, xvars, date_col="mthcaldt", nw_lags=4)
-            # fm_summary is a Series with slope_xxxx, tstat_xxxx, mean_R2, mean_N, etc.
+#             # 2) Fama-MacBeth summary
+#             fm_summary = fama_macbeth_summary(monthly_cs, xvars, date_col="mthcaldt", nw_lags=4)
+#             # fm_summary is a Series with slope_xxxx, tstat_xxxx, mean_R2, mean_N, etc.
 
-            # 3) Add info about the subset/model
-            fm_summary["subset"] = subset_name
-            fm_summary["model"]  = model_name
+#             # 3) Add info about the subset/model
+#             fm_summary["subset"] = subset_name
+#             fm_summary["model"]  = model_name
 
-            all_results.append(fm_summary)
+#             all_results.append(fm_summary)
 
-    # Convert to a nice table
-    table2_df = pd.DataFrame(all_results)
+#     # Convert to a nice table
+#     table2_df = pd.DataFrame(all_results)
 
-    return table2_df
+#     return table2_df
 
 
 def create_figure_1(subsets_comp_crsp: dict,
@@ -838,5 +838,5 @@ if __name__ == "__main__":
     table_2 = build_table_2(subsets_crsp_comp, factors_dict)
     
     # 9) Create Figure 1
-
+    figure_1 = create_figure_1(subsets_comp_crsp)
 
