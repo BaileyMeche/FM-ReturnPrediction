@@ -14,16 +14,11 @@ import numpy as np
 import pandas as pd
 import polars as pl
 from pandas.tseries.offsets import MonthEnd
+import statsmodels.api as sm
+import matplotlib.pyplot as plt
 
 from settings import config
-
-OUTPUT_DIR = Path(config("OUTPUT_DIR"))
-DATA_DIR = Path(config("DATA_DIR"))
-WRDS_USERNAME = config("WRDS_USERNAME")
-START_DATE = config("START_DATE")
-END_DATE = config("END_DATE")
-
-from utils import load_cache_data
+from utils import load_cache_data, _save_figure
 from pull_compustat import pull_Compustat, pull_CRSP_Comp_link_table
 from pull_crsp import pull_CRSP_stock, pull_CRSP_index
 from transform_compustat import (expand_compustat_annual_to_monthly,
@@ -32,12 +27,15 @@ from transform_compustat import (expand_compustat_annual_to_monthly,
                                  calc_book_equity
                                 )
 from transform_crsp import calculate_market_equity
+from regressions import run_monthly_cs_regressions, fama_macbeth_summary
+    
 
 # ==============================================================================================
 # GLOBAL CONFIGURATION
 # ==============================================================================================
 
 RAW_DATA_DIR = Path(config("RAW_DATA_DIR"))
+OUTPUT_DIR = Path(config("OUTPUT_DIR"))
 WRDS_USERNAME = config("WRDS_USERNAME")
 START_DATE = config("START_DATE")
 END_DATE = config("END_DATE")
@@ -530,7 +528,52 @@ def winsorize(crsp_comp: pd.DataFrame,
 
     return df
 
+def get_factors(crsp_comp: pd.DataFrame, crsp_d: pd.DataFrame,  crsp_index_d: pd.DataFrame):
     
+    # Calculate all variables
+    crsp_comp = crsp_comp.sort_values(["permno", "mthcaldt"])
+    crsp_d = crsp_d.sort_values(["permno", "dlycaldt"])
+    crsp_index_d = crsp_index_d.sort_values(["caldt"])
+    
+    crsp_comp = calc_log_size(crsp_comp)
+    crsp_comp = calc_log_bm(crsp_comp)
+    crsp_comp = calc_return_12_2(crsp_comp)
+    crsp_comp = calc_accruals(crsp_comp)  # or calc_accruals(crsp_comp) if you have them merged
+    crsp_comp       = calc_roa(crsp_comp)
+    crsp_comp = calc_log_assets_growth(crsp_comp)
+    crsp_comp = calc_dy(crsp_comp)
+    crsp_comp = calc_log_return_13_36(crsp_comp)
+    crsp_comp = calc_log_issues_12(crsp_comp)
+    crsp_comp = calc_log_issues_36(crsp_comp)
+    crsp_comp = calc_debt_price(crsp_comp)
+    crsp_comp = calc_sales_price(crsp_comp)
+    crsp_comp = calc_std_12(crsp_d, crsp_comp)
+    crsp_comp = calculate_rolling_beta(crsp_d, crsp_index_d, crsp_comp)
+
+    # Winsorize the variables to remove outliers
+    factors_dict = {
+    "Return (%)":                "retx",                # Assuming you are keeping this column name
+    "Log Size (-1)":             "log_size",
+    "Log B/M (-1)":              "log_bm",
+    "Return (-2, -12)":          "return_12_2",
+    "Log Issues (-1,-12)":       "log_issues_12",
+    "Accruals (-1)":             "accruals_final",
+    "ROA (-1)":                  "roa",
+    "Log Assets Growth (-1)":    "log_assets_growth",
+    "Dividend Yield (-1,-12)":   "dy",
+    "Log Return (-13,-36)":      "log_return_13_36",
+    "Log Issues (-1,-36)":       "log_issues_36",
+    "Beta (-1,-36)":             "rolling_beta",
+    "Std Dev (-1,-12)":          "rolling_std_252",
+    "Debt/Price (-1)":           "debt_price",
+    "Sales/Price (-1)":          "sales_price",
+    }
+
+    crsp_comp = winsorize(crsp_comp, factors_dict.values())
+
+    return crsp_comp, factors_dict
+
+
 def build_table_1(subsets_crsp_comp: dict, 
                   variables_dict: dict) -> pd.DataFrame:
     """
@@ -627,6 +670,139 @@ def build_table_1(subsets_crsp_comp: dict,
     return final_df
 
 
+def build_table_2(subsets_crsp_comp: dict):
+
+    models_predictors = {
+    'Model 1: Three Predictors': ['Log Size (-1)', 'Log B/M (-1)', 'Return (-2, -12)'],
+    'Model 2: Seven Predictors': [
+                        'Log Size (-1)', 'Log B/M (-1)', 'Return (-2, -12)', 'Log Issues (-1,-36)', 
+                        'Accruals (-1)', 'ROA (-1)', 'Log Assets Growth (-1)'
+                        ],
+    'Model 3: Fourteen Predictors': [
+                        'Log Size (-1)', 'Log B/M (-1)', 'Return (-2, -12)', 
+                        'Log Issues (-1,-12)', 'Accruals (-1)', 'ROA (-1)', 'Log Assets Growth (-1)', 
+                        'Dividend Yield (-1,-12)', 'Log Return (-13,-36)', 'Log Issues (-1,-36)', 
+                        'Beta (-1,-36)', 'Std Dev (-1,-12)', 'Debt/Price (-1)', 'Sales/Price (-1)'
+                        ]
+    }
+        
+    all_results = []
+
+    for subset_name, this_df in subsets_crsp_comp.items():
+        for model_name, xvars in models_predictors.items():
+
+            # 1) cross-sectional regressions by month
+            monthly_cs = run_monthly_cs_regressions(
+                df=this_df,
+                return_col="ret",      # or whatever your return column is 
+                predictor_cols=xvars,
+                date_col="mthcaldt"
+            )
+
+            # 2) Fama-MacBeth summary
+            fm_summary = fama_macbeth_summary(monthly_cs, xvars, date_col="mthcaldt", nw_lags=4)
+            # fm_summary is a Series with slope_xxxx, tstat_xxxx, mean_R2, mean_N, etc.
+
+            # 3) Add info about the subset/model
+            fm_summary["subset"] = subset_name
+            fm_summary["model"]  = model_name
+
+            all_results.append(fm_summary)
+
+    # Convert to a nice table
+    table2_df = pd.DataFrame(all_results)
+
+    return table2_df
+
+
+def create_figure_1(subsets_comp_crsp: dict) -> tuple:
+    """
+    Creates Figure 1 with two vertically stacked panels (Panel A: all_stocks,
+    Panel B: large_stocks), plotting ten-year rolling averages of Fama-MacBeth 
+    slopes from Model 2. The legend labels use descriptive text.
+    
+    The plotted lines now begin flush against the y-axis.
+    """
+    # Model 2 variables (actual DF column names)
+    model2_vars = ["log_bm", "return_12_2", "log_issues_36",
+                   "accruals_final", "log_assets_growth"]
+
+    # Mapping actual column names to descriptive legend labels
+    var_labels = {
+        "log_bm":            "B/M",
+        "return_12_2":       "Ret12",
+        "log_issues_36":     "Issue36",
+        "accruals_final":    "Accruals",
+        "log_assets_growth": "Log AG"
+    }
+
+    # Dictionary to collect monthly slope DataFrames
+    slopes_dict = {}
+
+    # Loop over the two subsets: "all_stocks" and "large_stocks"
+    for subset_name in ["all_stocks", "large_stocks"]:
+        if subset_name not in subsets_comp_crsp:
+            continue
+
+        df_sub = subsets_comp_crsp[subset_name].copy()
+        df_sub = df_sub.sort_values(["mthcaldt", "permno"])
+        df_sub = df_sub.dropna(subset=["retx"] + model2_vars)
+        if df_sub.empty:
+            continue
+
+        monthly_slopes = []
+
+        # Run cross-sectional regression for each month
+        for mth, grp in df_sub.groupby("mthcaldt"):
+            y = grp["retx"]
+            X = grp[model2_vars]
+            X = sm.add_constant(X, has_constant="add")
+            if len(X) < len(model2_vars) + 1:
+                continue
+
+            model = sm.OLS(y, X, missing='drop')
+            result = model.fit()
+            slope_row = {"mthcaldt": mth}
+            for var in ["const"] + model2_vars:
+                slope_row[var] = result.params.get(var, np.nan)
+            monthly_slopes.append(slope_row)
+
+        slopes_df = pd.DataFrame(monthly_slopes).set_index("mthcaldt").sort_index()
+        # Calculate 10-year rolling means (120 months)
+        slopes_rolling = slopes_df.rolling(window=120, min_periods=60).mean()
+        slopes_dict[subset_name] = slopes_rolling
+
+    # Create the figure with two vertically stacked subplots (2 rows, 1 column)
+    fig, axes = plt.subplots(nrows=2, ncols=1, figsize=(14, 10), sharex=True)
+    ax_a, ax_b = axes
+
+    # Panel A: All Stocks
+    if "all_stocks" in slopes_dict:
+        df_a = slopes_dict["all_stocks"]
+        for var in model2_vars:
+            ax_a.plot(df_a.index, df_a[var], label=var_labels.get(var, var))
+        ax_a.set_title("Panel A: All Stocks (10-Year Rolling Slopes)")
+        ax_a.set_ylabel("Slope Coefficient")
+        ax_a.legend()
+        # Set margins to zero so the line starts flush with the y-axis
+        ax_a.margins(x=0)
+
+    # Panel B: Large Stocks
+    if "large_stocks" in slopes_dict:
+        df_b = slopes_dict["large_stocks"]
+        for var in model2_vars:
+            ax_b.plot(df_b.index, df_b[var], label=var_labels.get(var, var))
+        ax_b.set_title("Panel B: Large Stocks (10-Year Rolling Slopes)")
+        ax_b.set_xlabel("Month")
+        ax_b.set_ylabel("Slope Coefficient")
+        ax_b.legend()
+        # Set margins to zero so the line starts flush with the y-axis
+        ax_b.margins(x=0)
+
+    plt.tight_layout()
+    return fig, axes
+
+
 if __name__ == "__main__":
 
     # 1) Load raw data
@@ -647,63 +823,12 @@ if __name__ == "__main__":
     # 3) Merge comp + crsp_m + ccm => crsp_comp
     crsp_comp = merge_CRSP_and_Compustat(crsp, comp, ccm)
 
-    # 4) Calculate all variables
-    crsp_comp = crsp_comp.sort_values(["permno", "mthcaldt"])
-    crsp_d = crsp_d.sort_values(["permno", "dlycaldt"])
-    crsp_index_d = crsp_index_d.sort_values(["caldt"])
-    
-    crsp_comp = calc_log_size(crsp_comp)
-    crsp_comp = calc_log_bm(crsp_comp)
-    crsp_comp = calc_return_12_2(crsp_comp)
-    crsp_comp = calc_accruals(crsp_comp)  # or calc_accruals(crsp_comp) if you have them merged
-    crsp_comp       = calc_roa(crsp_comp)
-    crsp_comp = calc_log_assets_growth(crsp_comp)
-    crsp_comp = calc_dy(crsp_comp)
-    crsp_comp = calc_log_return_13_36(crsp_comp)
-    crsp_comp = calc_log_issues_12(crsp_comp)
-    crsp_comp = calc_log_issues_36(crsp_comp)
-    crsp_comp = calc_debt_price(crsp_comp)
-    crsp_comp = calc_sales_price(crsp_comp)
-    crsp_comp = calc_std_12(crsp_d, crsp_comp)
-    crsp_comp = calculate_rolling_beta(crsp_d, crsp_index_d, crsp_comp)
-
-    # 5) Winsorize the variables to remove outliers
-    variables_dict = {
-    "Return (%)":                "retx",                # Assuming you are keeping this column name
-    "Log Size (-1)":             "log_size",
-    "Log B/M (-1)":              "log_bm",
-    "Return (-2, -12)":          "return_12_2",
-    "Log Issues (-1,-12)":       "log_issues_12",
-    "Accruals (-1)":             "accruals_final",
-    "ROA (-1)":                  "roa",
-    "Log Assets Growth (-1)":    "log_assets_growth",
-    "Dividend Yield (-1,-12)":   "dy",
-    "Log Return (-13,-36)":      "log_return_13_36",
-    "Log Issues (-1,-36)":       "log_issues_36",
-    "Beta (-1,-36)":             "rolling_beta",
-    "Std Dev (-1,-12)":          "rolling_std_252",
-    "Debt/Price (-1)":           "debt_price",
-    "Sales/Price (-1)":          "sales_price",
-    }
-    crsp_comp = winsorize(crsp_comp, variables_dict.values())
+    crsp_comp = get_factors(crsp_comp, crsp_d, crsp_index_d)
 
     # 6) Create subsets for analysis
     subsets_comp_crsp = get_subsets(crsp_comp) # Dictionary of dataframes corresponding of the data sets
 
     # 7) Build Table 1
-    table_1 = build_table_1(subsets_comp_crsp, variables_dict)
+    table_1 = build_table_1(subsets_comp_crsp)
 
 
-    models = {
-        'Model 1: Three Predictors': ['Log Size (-1)', 'Log B/M (-1)', 'Return (-2, -12)'],
-        'Model 2: Seven Predictors': [
-                            'Log Size (-1)', 'Log B/M (-1)', 'Return (-2, -12)', 'Log Issues (-1,-36)', 
-                            'Accruals (-1)', 'ROA (-1)', 'Log Assets Growth (-1)'
-                            ],
-        'Model 3: Fourteen Predictors': [
-                            'Log Size (-1)', 'Log B/M (-1)', 'Return (-2, -12)', 
-                            'Log Issues (-1,-12)', 'Accruals (-1)', 'ROA (-1)', 'Log Assets Growth (-1)', 
-                            'Dividend Yield (-1,-12)', 'Log Return (-13,-36)', 'Log Issues (-1,-36)', 
-                            'Beta (-1,-36)', 'Std Dev (-1,-12)', 'Debt/Price (-1)', 'Sales/Price (-1)'
-                            ]
-    }
