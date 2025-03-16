@@ -238,21 +238,6 @@ def task_run_notebooks():
 #     }
 
 
-# ====================================================================================
-# Sphinx documentation
-# ====================================================================================
-
-notebook_sphinx_pages = [
-    "./_docs/_build/html/notebooks/" + notebook.split(".")[0] + ".html"
-    for notebook in notebook_tasks.keys()
-]
-sphinx_targets = [
-    #"./_docs/_build/html/index.html",
-    #"./_docs/_build/html/myst_markdown_demos.html",
-    *notebook_sphinx_pages,
-]
-
-
 def copy_docs_src_to_docs():
     """
     Copy all files and subdirectories from the docs_src directory to the _docs directory.
@@ -297,31 +282,3 @@ def copy_docs_build_to_docs():
     
     # Touch an empty .nojekyll file in the docs directory.
     (dst / ".nojekyll").touch()
-
-
-
-
-def task_compile_sphinx_docs():
-    """Compile Sphinx Docs"""
-    notebook_scripts = [
-        OUTPUT_DIR / ("_" + notebook.split(".")[0] + ".py")
-        for notebook in notebook_tasks.keys()
-    ]
-    file_dep = [
-        #"./docs_src/conf.py",
-        #"./docs_src/index.md",
-        #"./docs_src/myst_markdown_demos.md",
-        *notebook_scripts,
-    ]
-
-    return {
-        "actions": [
-            copy_docs_src_to_docs, # Move configurations and source files from docs_src to _docs
-            #"sphinx-build -M html ./_docs/ ./_docs/_build", # Build the Sphinx documentation from the source files at ./_docs/ and output to ./_docs/_build
-            copy_docs_build_to_docs, # Move the built documentation from ./_docs/_build to docs
-            ],
-        "targets": sphinx_targets,
-        "file_dep": file_dep,
-        "task_dep": ["run_notebooks"],
-        "clean": True,
-    }
