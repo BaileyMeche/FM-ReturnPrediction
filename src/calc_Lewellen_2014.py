@@ -956,6 +956,23 @@ def create_figure_1(subsets_comp_crsp: dict,
     plt.tight_layout()
     return fig, axes
 
+def save_data(table_1, table_2, figure_1):
+        # Save tables as Pickle
+    table_1.to_pickle('../_output/table_1.pkl')
+    table_2.to_pickle('../_output/table_2.pkl')
+
+    # Save tables as LaTeX
+    latex_table_1 = table_1.to_latex(index=True, bold_rows=True, multicolumn=True)
+    with open('../_output/table_1.tex', 'w') as f:
+        f.write(latex_table_1)
+
+    latex_table_2 = table_2.to_latex(index=True, bold_rows=True, multicolumn=True)
+    with open('../_output/table_2.tex', 'w') as f:
+        f.write(latex_table_2)
+
+    # Export Figure 1
+    figure_1[0].savefig('../_output/figure_1.svg', bbox_inches='tight')
+
 
 if __name__ == "__main__":
 
@@ -992,3 +1009,5 @@ if __name__ == "__main__":
     # 9) Create Figure 1
     figure_1 = create_figure_1(subsets_comp_crsp)
 
+    # 10) Save data
+    save_data(table_1, table_2, figure_1)
