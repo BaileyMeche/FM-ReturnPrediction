@@ -105,7 +105,7 @@ def get_subsets(crsp_comp: pd.DataFrame) -> dict:
     large_stocks_df = crsp_comp.loc[crsp_comp["is_large"] == True].copy()
 
     subsets_crsp_comp = {
-        "All Stocks":          all_stocks_df,
+        "All stocks":          all_stocks_df,
         "All-but-tiny stocks": all_but_tiny_df,
         "Large stocks":        large_stocks_df,
     }
@@ -582,7 +582,7 @@ def build_table_1(subsets_crsp_comp: dict,
 
     subsets_crsp_comp : dict
       {
-         "All Stocks": <DataFrame>,
+         "All stocks": <DataFrame>,
          "All-but-tiny stocks": <DataFrame>,
          "Large stocks": <DataFrame>
       }
@@ -665,12 +665,13 @@ def build_table_1(subsets_crsp_comp: dict,
     final_df = pd.concat(partial_dfs, axis=1)
 
     # Sort columns in a nice order if needed
-    # final_df = final_df.reindex(columns=["All Stocks", "All-but-tiny stocks", "Large stocks"], level=0)
+    # final_df = final_df.reindex(columns=["All stocks", "All-but-tiny stocks", "Large stocks"], level=0)
 
     return final_df
 
 
-def build_table_2(subsets_crsp_comp: dict):
+
+def build_table_2(subsets_crsp_comp: dict, factors_dict: dict):
 
     models_predictors = {
     'Model 1: Three Predictors': ['Log Size (-1)', 'Log B/M (-1)', 'Return (-2, -12)'],
@@ -688,13 +689,13 @@ def build_table_2(subsets_crsp_comp: dict):
         
     all_results = []
 
-    for subset_name, this_df in subsets_crsp_comp.items():
-        for model_name, xvars in models_predictors.items():
-
+    for subset_name, df in subsets_crsp_comp.items():
+        for model_name, xvars_names in models_predictors.items():
+            xvars = [factors_dict[xvar_name] for xvar_name in xvars_names]
             # 1) cross-sectional regressions by month
             monthly_cs = run_monthly_cs_regressions(
-                df=this_df,
-                return_col="ret",      # or whatever your return column is 
+                df=df,
+                return_col="retx",      # or whatever your return column is 
                 predictor_cols=xvars,
                 date_col="mthcaldt"
             )
@@ -715,7 +716,9 @@ def build_table_2(subsets_crsp_comp: dict):
     return table2_df
 
 
-def create_figure_1(subsets_comp_crsp: dict) -> tuple:
+def create_figure_1(subsets_comp_crsp: dict,
+                    save_plot: bool = True,
+                    output_dir: Union[None, Path] = OUTPUT_DIR) -> tuple:
     """
     Creates Figure 1 with two vertically stacked panels (Panel A: all_stocks,
     Panel B: large_stocks), plotting ten-year rolling averages of Fama-MacBeth 
@@ -725,7 +728,7 @@ def create_figure_1(subsets_comp_crsp: dict) -> tuple:
     """
     # Model 2 variables (actual DF column names)
     model2_vars = ["log_bm", "return_12_2", "log_issues_36",
-                   "accruals_final", "log_assets_growth"]
+                "accruals_final", "log_assets_growth"]
 
     # Mapping actual column names to descriptive legend labels
     var_labels = {
@@ -740,7 +743,7 @@ def create_figure_1(subsets_comp_crsp: dict) -> tuple:
     slopes_dict = {}
 
     # Loop over the two subsets: "all_stocks" and "large_stocks"
-    for subset_name in ["all_stocks", "large_stocks"]:
+    for subset_name in ["All Stocks", "Large stocks"]:
         if subset_name not in subsets_comp_crsp:
             continue
 
@@ -751,7 +754,6 @@ def create_figure_1(subsets_comp_crsp: dict) -> tuple:
             continue
 
         monthly_slopes = []
-
         # Run cross-sectional regression for each month
         for mth, grp in df_sub.groupby("mthcaldt"):
             y = grp["retx"]
@@ -759,7 +761,7 @@ def create_figure_1(subsets_comp_crsp: dict) -> tuple:
             X = sm.add_constant(X, has_constant="add")
             if len(X) < len(model2_vars) + 1:
                 continue
-
+            
             model = sm.OLS(y, X, missing='drop')
             result = model.fit()
             slope_row = {"mthcaldt": mth}
@@ -777,8 +779,8 @@ def create_figure_1(subsets_comp_crsp: dict) -> tuple:
     ax_a, ax_b = axes
 
     # Panel A: All Stocks
-    if "all_stocks" in slopes_dict:
-        df_a = slopes_dict["all_stocks"]
+    if "All Stocks" in slopes_dict:
+        df_a = slopes_dict["All Stocks"]
         for var in model2_vars:
             ax_a.plot(df_a.index, df_a[var], label=var_labels.get(var, var))
         ax_a.set_title("Panel A: All Stocks (10-Year Rolling Slopes)")
@@ -788,8 +790,8 @@ def create_figure_1(subsets_comp_crsp: dict) -> tuple:
         ax_a.margins(x=0)
 
     # Panel B: Large Stocks
-    if "large_stocks" in slopes_dict:
-        df_b = slopes_dict["large_stocks"]
+    if "Large stocks" in slopes_dict:
+        df_b = slopes_dict["Large stocks"]
         for var in model2_vars:
             ax_b.plot(df_b.index, df_b[var], label=var_labels.get(var, var))
         ax_b.set_title("Panel B: Large Stocks (10-Year Rolling Slopes)")
@@ -823,12 +825,18 @@ if __name__ == "__main__":
     # 3) Merge comp + crsp_m + ccm => crsp_comp
     crsp_comp = merge_CRSP_and_Compustat(crsp, comp, ccm)
 
-    crsp_comp = get_factors(crsp_comp, crsp_d, crsp_index_d)
+    # 4 Calculate factors
+    crsp_comp, factors_dict = get_factors(crsp_comp, crsp_d, crsp_index_d)
 
     # 6) Create subsets for analysis
-    subsets_comp_crsp = get_subsets(crsp_comp) # Dictionary of dataframes corresponding of the data sets
+    subsets_comp_crsp,  = get_subsets(crsp_comp) # Dictionary of dataframes corresponding of the data sets
 
     # 7) Build Table 1
     table_1 = build_table_1(subsets_comp_crsp)
+
+    # 8) Build Table 2
+    table_2 = build_table_2(subsets_crsp_comp, factors_dict)
+    
+    # 9) Create Figure 1
 
 
