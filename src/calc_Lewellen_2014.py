@@ -957,21 +957,53 @@ def create_figure_1(subsets_comp_crsp: dict,
     return fig, axes
 
 def save_data(table_1, table_2, figure_1):
-        # Save tables as Pickle
-    table_1.to_pickle('../_output/table_1.pkl')
-    table_2.to_pickle('../_output/table_2.pkl')
+    import os
+    from pathlib import Path
+    
+    # Create output directory if it doesn't exist
+    output_dir = Path('../_output')
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Save tables as Pickle
+    table_1.to_pickle(output_dir / 'table_1.pkl')
+    table_2.to_pickle(output_dir / 'table_2.pkl')
 
     # Save tables as LaTeX
     latex_table_1 = table_1.to_latex(index=True, bold_rows=True, multicolumn=True)
-    with open('../_output/table_1.tex', 'w') as f:
+    with open(output_dir / 'table_1.tex', 'w') as f:
         f.write(latex_table_1)
 
     latex_table_2 = table_2.to_latex(index=True, bold_rows=True, multicolumn=True)
-    with open('../_output/table_2.tex', 'w') as f:
+    with open(output_dir / 'table_2.tex', 'w') as f:
         f.write(latex_table_2)
 
     # Export Figure 1
-    figure_1[0].savefig('../_output/figure_1.svg', bbox_inches='tight')
+    figure_1[0].savefig(output_dir / 'figure_1.svg', bbox_inches='tight')
+    
+    # Create a marker file indicating successful save
+    marker_file = output_dir / 'data_saved.marker'
+    with open(marker_file, 'w') as f:
+        from datetime import datetime
+        f.write(f"Data saved successfully at {datetime.now().isoformat()}")
+    
+    print(f"All data saved successfully. Marker file created at {marker_file}")
+    
+    return marker_file
+
+def check_if_data_saved():
+    from pathlib import Path
+    marker_file = Path('../_output/data_saved.marker')
+    
+    if marker_file.exists():
+        print("Data has been saved previously.")
+        with open(marker_file, 'r') as f:
+            timestamp = f.read()
+        print(f"Save timestamp: {timestamp}")
+        return True
+    else:
+        print("Data has not been saved yet.")
+        return False
+
 
 
 if __name__ == "__main__":
