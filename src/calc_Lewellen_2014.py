@@ -387,6 +387,9 @@ def calculate_rolling_beta(crsp_d: pd.DataFrame,
         (pl.col("Rm") + 1).log().alias("log_Rm")
     ])
 
+    # Sort by date
+    df_joined = df_joined.sort(["permno", "date"])
+
     # Convert to a LazyFrame to use groupby_rolling
     lazy_df = df_joined.lazy()
 
