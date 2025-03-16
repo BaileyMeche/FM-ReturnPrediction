@@ -165,24 +165,27 @@ def task_run_notebooks():
     """
     for notebook in notebook_tasks.keys():
         notebook_name = notebook.split(".")[0]
+        
+        # Check if this is get_data.ipynb - special handling
+        is_get_data = notebook_name == "get_data"
+        marker_file = OUTPUT_DIR / f"{notebook_name}_processed.marker"
+        
         yield {
             "name": notebook,
             "actions": [
                 """python -c "import sys; from datetime import datetime; print(f'Start """ + notebook + """: {datetime.now()}', file=sys.stderr)" """,
-                jupyter_execute_notebook(notebook_name),
-                jupyter_to_html(notebook_name),
+                # Execute to a new file in output dir, NOT modifying source
+                f'jupyter nbconvert --execute --to notebook --output-dir="{OUTPUT_DIR}" --output "{notebook_name}_executed" "{Path("./src")}/{notebook}"',
+                # Generate HTML from the executed notebook (not source)
+                f'jupyter nbconvert --to html --log-level WARN --output-dir="{OUTPUT_DIR}" "{OUTPUT_DIR}/{notebook_name}_executed.ipynb"',
+                # Copy HTML to docs
                 copy_file(
-                    Path("./src") / f"{notebook_name}.ipynb",
-                    OUTPUT_DIR / f"{notebook_name}.ipynb",
-                    mkdir=True,
-                ),
-                copy_file(
-                    OUTPUT_DIR / f"{notebook_name}.html",
+                    OUTPUT_DIR / f"{notebook_name}_executed.html",
                     Path("./docs") / f"{notebook_name}.html",
                     mkdir=True,
                 ),
-                jupyter_clear_output(notebook_name),
-                # jupyter_to_python(notebook_name, build_dir),
+                # Create marker file for get_data to avoid re-running
+                f'python -c "open(r\'{marker_file}\', \'w\').write(\'processed\')" if not Path(r\'{marker_file}\').exists() else None',
                 """python -c "import sys; from datetime import datetime; print(f'End """ + notebook + """: {datetime.now()}', file=sys.stderr)" """,
             ],
             "file_dep": [
@@ -190,10 +193,15 @@ def task_run_notebooks():
                 *notebook_tasks[notebook]["file_dep"],
             ],
             "targets": [
-                OUTPUT_DIR / f"{notebook_name}.html",
-                OUTPUT_DIR / f"{notebook_name}.ipynb",
-                *notebook_tasks[notebook]["targets"],
+                OUTPUT_DIR / f"{notebook_name}_executed.ipynb",
+                OUTPUT_DIR / f"{notebook_name}_executed.html",
+                Path("./docs") / f"{notebook_name}.html",
+                marker_file if is_get_data else None,
             ],
+            # Skip if get_data has already been processed
+            "uptodate": [
+                lambda task, values: is_get_data and marker_file.exists()
+            ] if is_get_data else None,
             "clean": True,
         }
 # fmt: on
