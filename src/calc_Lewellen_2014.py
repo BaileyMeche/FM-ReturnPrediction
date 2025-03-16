@@ -107,9 +107,9 @@ def get_subsets(crsp_comp: pd.DataFrame) -> dict:
     large_stocks_df = crsp_comp.loc[crsp_comp["is_large"] == True].copy()
 
     subsets_crsp_comp = {
-        "all_stocks":          all_stocks_df,
-        "all_but_tiny_stocks": all_but_tiny_df,
-        "large_stocks":        large_stocks_df,
+        "All Stocks":          all_stocks_df,
+        "All-but-tiny stocks": all_but_tiny_df,
+        "Large stocks":        large_stocks_df,
     }
     return subsets_crsp_comp
 
@@ -454,6 +454,9 @@ def calc_std_12(crsp_d: pd.DataFrame, crsp_comp: pd.DataFrame) -> pd.DataFrame:
         .reset_index(level=0, drop=True)
     )
 
+    # Annualize:
+    df_std_12["rolling_std_252"] = df_std_12["rolling_std_252"] * np.sqrt(252)
+
     # 3) For each month-end, pick the last available daily std in that month
     #    We'll create 'month_end' for daily data, then do a groupby last.
     df_std_12["jdate"] = df_std_12["dlycaldt"].dt.to_period("M").dt.to_timestamp("M")
@@ -528,74 +531,100 @@ def winsorize(crsp_comp: pd.DataFrame,
     return df
 
     
-def build_table_1(subsets_crsp_comp: dict,
+def build_table_1(subsets_crsp_comp: dict, 
                   variables_dict: dict) -> pd.DataFrame:
     """
-    For each variable in `variables_dict`, compute monthly cross-sectional
-    (mean, std, count) and then time-series average those stats. We'll do it
-    for each subset in `subsets_crsp_comp`.
+    Build a Table 1 with MultiIndex columns. For each subset in subsets_crsp_comp,
+    we calculate time-series average of monthly cross-sectional stats for each variable.
 
-    Parameters
-    ----------
     subsets_crsp_comp : dict
-        {
-          "all_stocks":          <DataFrame>,
-          "all_but_tiny_stocks": <DataFrame>,
-          "large_stocks":        <DataFrame>
-        }
+      {
+         "All Stocks": <DataFrame>,
+         "All-but-tiny stocks": <DataFrame>,
+         "Large stocks": <DataFrame>
+      }
+
     variables_dict : dict
-        Example:
-        {
-          "Return (%)": "retx",
-          "Log Size (-1)": "log_size",
-          "Log B/M (-1)":  "log_bm",
-           ...
-        }
+      {
+        "Return (%)": "retx",
+        "Log Size (-1)": "log_size",
+        ...
+      }
 
     Returns
     -------
     pd.DataFrame
-       One row per variable in `variables_dict`,
-       columns = [<subset>_Mean, <subset>_Std, <subset>_N] for each subset.
+        A table with one row per variable in `columns_of_interest`. Columns:
+          - 'Avg':    The time-series average of the monthly cross-sectional means
+          - 'Std':    The time-series average of the monthly cross-sectional stds
+          - 'N':      The total number of unique permnos (distinct stocks) that appear for that variable in
     """
-    results = []
 
-    for var_label, var_col in variables_dict.items():
-        row_stats = []
+    subset_tables = {}  # We'll store a partial table for each subset
 
-        # For each subset DataFrame in subsets_crsp_comp
-        for subset_name, df_subset in subsets_crsp_comp.items():
-            # 1) Filter out nulls
-            df_var = df_subset.dropna(subset=[var_col])
-            if df_var.empty:
-                # If none, fill with NaN
-                row_stats.extend([np.nan, np.nan, np.nan])
+    for subset_name, df_subset in subsets_crsp_comp.items():
+        rows = []
+        
+        for var_label, var_col in variables_dict.items():
+            # 1) Keep only relevant columns
+            if var_col not in df_subset.columns:
+                # If for some reason this column doesn't exist, skip or fill with NaN
+                rows.append({
+                    "Column": var_label,
+                    "Avg": np.nan,
+                    "Std": np.nan,
+                    "N":   np.nan
+                })
                 continue
 
-            # 2) Group by month, compute cross-sectional stats
-            monthly_stats = df_var.groupby("mthcaldt")[var_col].agg(["mean", "std", "count"])
+            df_clean = df_subset[[var_col, "mthcaldt", "permno"]].copy()
+            # 2) Replace inf with NaN, drop rows with NaN in var_col
+            df_clean.replace([np.inf, -np.inf], np.nan, inplace=True)
+            df_clean.dropna(subset=[var_col], inplace=True)
 
-            # 3) Time-series average across months
+            if df_clean.empty:
+                rows.append({
+                    "Column": var_label,
+                    "Avg": np.nan,
+                    "Std": np.nan,
+                    "N":   np.nan
+                })
+                continue
+
+            # 3) Group by month, compute cross-sectional mean, std
+            monthly_stats = df_clean.groupby("mthcaldt")[var_col].agg(["mean", "std"])
+            # 4) Time-series average of monthly means, monthly std
             avg_mean = monthly_stats["mean"].mean()
             avg_std  = monthly_stats["std"].mean()
-            avg_n    = monthly_stats["count"].mean()
 
-            row_stats.extend([avg_mean, avg_std, avg_n])
+            # 5) N as total distinct permnos in the entire subset (like your friend’s example)
+            N = df_clean["permno"].nunique()
 
-        # We'll store a tuple of: (var_label, subset1 stats, subset2 stats, ...)
-        results.append((var_label, *row_stats))
+            rows.append({"Column": var_label, "Avg": avg_mean, "Std": avg_std, "N": N})
 
-    # Build columns
-    columns = ["Variable"]
-    for subset_name in subsets_crsp_comp.keys():
-        columns += [
-            f"{subset_name}_Mean",
-            f"{subset_name}_Std",
-            f"{subset_name}_N"
-        ]
+        # Build a partial DataFrame for this subset
+        partial_df = pd.DataFrame(rows).set_index("Column")
+        # We'll store it
+        subset_tables[subset_name] = partial_df
 
-    summary_df = pd.DataFrame(results, columns=columns)
-    return summary_df
+    # Now we merge them side-by-side with MultiIndex columns
+    # Example: top-level is subset_name, second-level is [Avg, Std, N]
+    partial_dfs = []
+    for subset_name, partial_df in subset_tables.items():
+        # Rename columns with a MultiIndex
+        partial_df.columns = pd.MultiIndex.from_product([
+            [subset_name],
+            partial_df.columns
+        ])
+        partial_dfs.append(partial_df)
+
+    # Concatenate along columns (axis=1)
+    final_df = pd.concat(partial_dfs, axis=1)
+
+    # Sort columns in a nice order if needed
+    # final_df = final_df.reindex(columns=["All Stocks", "All-but-tiny stocks", "Large stocks"], level=0)
+
+    return final_df
 
 
 if __name__ == "__main__":
