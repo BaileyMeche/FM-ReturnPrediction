@@ -978,7 +978,7 @@ def save_data(table_1, table_2, figure_1):
         f.write(latex_table_2)
 
     # Export Figure 1
-    figure_1[0].savefig(output_dir / 'figure_1.svg', bbox_inches='tight')
+    figure_1[0].savefig(output_dir / 'figure_1.pdf', bbox_inches='tight')
     
     # Create a marker file indicating successful save
     marker_file = output_dir / 'data_saved.marker'
