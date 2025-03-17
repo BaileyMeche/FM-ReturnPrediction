@@ -1003,8 +1003,232 @@ def check_if_data_saved():
     else:
         print("Data has not been saved yet.")
         return False
+    
+def create_latex_document_from_pkl():
+    """
+    Reads table_1.pkl and table_2.pkl from ../_output,
+    generates LaTeX tables via pandas' to_latex(),
+    and writes a complete LaTeX document (research_report.tex).
+    
+    Advantages:
+      - Avoids post-processing raw .tex files
+      - Minimizes bracket / runaway-argument errors
+      - Auto-escapes underscores, carets, etc.
+      - Simple to tweak column names or apply further styling
+    """
+    import pandas as pd
+    from pathlib import Path
+    from datetime import datetime
 
+    # ----------------------
+    #  PATHS & CHECKS
+    # ----------------------
+    output_dir = Path('../_output')
+    output_dir.mkdir(parents=True, exist_ok=True)
 
+    table1_pkl = output_dir / 'table_1.pkl'
+    table2_pkl = output_dir / 'table_2.pkl'
+    figure1_path = output_dir / 'figure_1.pdf'
+
+    missing_files = []
+    for f in [table1_pkl, table2_pkl, figure1_path]:
+        if not f.exists():
+            missing_files.append(str(f))
+
+    if missing_files:
+        print("Missing files:", ", ".join(missing_files))
+        return None
+
+    # ----------------------
+    #  READ THE PICKLED DFS
+    # ----------------------
+    try:
+        df1 = pd.read_pickle(table1_pkl)
+        df2 = pd.read_pickle(table2_pkl)
+    except Exception as e:
+        print(f"Error loading pickles: {e}")
+        return None
+
+    # ----------------------
+    #  OPTIONAL CLEANUP: R^2, etc.
+    # ----------------------
+    # If you want to rename columns that literally contain R^2 -> $R^2$, do so here:
+    # e.g. df1.columns = [col.replace("R^2", "$R^2$") for col in df1.columns]
+
+    # Similarly, if underscores in columns are meant to be literal underscores,
+    # pandas with escape=True will turn them into \_ automatically.
+
+    # ----------------------
+    #  GENERATE LATEX TABLES
+    # ----------------------
+    # By default, pandas will do basic tabular formatting, auto-escape underscores, etc.
+    # If your data is wide, adjust the column format or other to_latex options as needed.
+    # e.g. to_latex(index=False, float_format="%.3f") or to_latex(longtable=True)
+    
+    # Example: no index, and limit floating decimals to 3
+    latex_table1 = df1.to_latex(index=False, float_format="%.4f", escape=True)
+    latex_table2 = df2.to_latex(index=False, float_format="%.4f", escape=True)
+
+    # If the DataFrame has multi-level columns or indices, you may need different arguments,
+    # or you might want to flatten them first.
+
+    # ----------------------
+    #  WRAP TABLE ENVIRONMENTS
+    # ----------------------
+    # In many cases, you might just keep the raw output of to_latex(), but let's wrap
+    # them in table floats for the final doc:
+
+    table1_content = f"""    
+\\begin{{table}}
+\\centering
+\\caption{{Summary Statistics}}
+\\label{{tab:table1}}
+{latex_table1}
+\\end{{table}}"""
+
+    table2_content = f"""\\begin{{table}}
+\\centering
+\\caption{{Return Predictability}}
+\\label{{tab:table2}}
+{latex_table2}
+\\end{{table}}"""
+
+    # ----------------------
+    #  CREATE THE FULL LATEX DOC
+    # ----------------------
+    latex_doc = f"""\\documentclass[12pt]{{article}}
+\\usepackage{{booktabs}}
+\\usepackage{{graphicx}}
+\\usepackage{{caption}}
+\\usepackage{{geometry}}
+\\usepackage{{multirow}}  % in case you need multirow in any table
+\\usepackage{{placeins}}   % <-- This package adds \FloatBarrier
+\\geometry{{margin=1in}}
+
+\\title{{Return Prediction Results}}
+\\author{{Financial Markets Analysis}}
+\\date{{{datetime.now().strftime('%B %d, %Y')}}}
+
+\\begin{{document}}
+
+\\maketitle
+
+\\section{{Data Summary}}
+
+{table1_content}
+
+\\clearpage
+\\section{{Regression Results}}
+
+{table2_content}
+
+\\clearpage
+\\section{{Time-Series Patterns}}
+\\FloatBarrier   % <--- Force all floats before this point to appear
+
+\\begin{{figure}}
+\\caption{{Time-series of return predictability.}}
+\\centering
+\\includegraphics[width=0.9\\textwidth]{{{figure1_path.name}}}
+\\label{{fig:figure1}}
+\\end{{figure}}
+
+\\end{{document}}
+"""
+
+    # ----------------------
+    #  WRITE OUT RESEARCH_REPORT.TEX
+    # ----------------------
+    output_file = output_dir / "research_report.tex"
+    try:
+        with open(output_file, "w", encoding="utf-8") as out_f:
+            out_f.write(latex_doc)
+    except Exception as e:
+        print(f"Error writing LaTeX document: {e}")
+        return None
+
+    print(f"LaTeX document created successfully:\n{output_file}")
+    return output_file
+
+def compile_latex_document(tex_file_path=None):
+    """
+    Compiles a LaTeX document to PDF using pdflatex.
+    
+    Parameters:
+    
+        tex_file_path: Path to the .tex file. If None, defaults to '../_output/research_report.tex'
+    
+    Returns:
+        Path to the output PDF if compilation was successful, None otherwise
+    """
+    import subprocess
+    import os
+    from pathlib import Path
+    import shutil
+    
+    # First check if pdflatex is available
+    pdflatex_path = shutil.which('pdflatex')
+    if not pdflatex_path:
+        print("Error: pdflatex not found in PATH. Please install a LaTeX distribution like MiKTeX or TeXLive.")
+        print("Alternatively, you can compile the .tex file manually.")
+        return None
+    
+    # Default path if none provided
+    if tex_file_path is None:
+        tex_file_path = Path('../_output/research_report.tex')
+    else:
+        tex_file_path = Path(tex_file_path)
+    
+    if not tex_file_path.exists():
+        print(f"Error: LaTeX file not found at {tex_file_path}")
+        return None
+        
+    # Get directory and filename
+    tex_dir = tex_file_path.parent
+    tex_filename = tex_file_path.name
+    
+    # Change to the directory containing the .tex file
+    original_dir = os.getcwd()
+    os.chdir(tex_dir)
+    
+    try:
+        print(f"Compiling {tex_filename} with pdflatex...")
+        # Run pdflatex twice to resolve references
+        for i in range(2):
+            print(f"LaTeX compilation pass {i+1}...")
+            # Use -interaction=nonstopmode to continue on errors
+            result = subprocess.run(
+                [pdflatex_path, '-interaction=nonstopmode', tex_filename],
+                capture_output=True, 
+                text=True
+            )
+            
+            if result.returncode != 0:
+                print("LaTeX compilation errors:")
+                print(result.stderr)
+                # Don't exit yet, sometimes it works despite errors
+        
+        # Check if PDF was created
+        pdf_path = tex_file_path.with_suffix('.pdf')
+        
+        if pdf_path.exists():
+            print(f"PDF successfully compiled: {pdf_path}")
+            # Return to original directory
+            os.chdir(original_dir)
+            return pdf_path
+        else:
+            print(f"PDF compilation failed. No file found at {pdf_path}")
+            os.chdir(original_dir)
+            return None
+            
+    except Exception as e:
+        print(f"Error during compilation: {str(e)}")
+        os.chdir(original_dir)
+        return None
+        
+    finally:
+        # Make sure we return to original directory even if there's an error
+        os.chdir(original_dir)
 
 if __name__ == "__main__":
 
@@ -1043,3 +1267,7 @@ if __name__ == "__main__":
 
     # 10) Save data
     save_data(table_1, table_2, figure_1)
+    
+    # 11) Create and compile LaTeX document
+    create_latex_document_from_pkl()
+    compile_latex_document()
